@@ -104,6 +104,9 @@ while True:
     if n % {STILL_EVERY} == 0:
         node.outputs['out'].send(f)
 """
+HLS_DIR = os.path.join(OUT, "hls")       # live 4K H.264, segmented by ffmpeg
+CLIPS_DIR = os.path.join(OUT, "clips")
+HLS_IDLE_S = 25                          # stop encoding to disk once nobody is watching
 STREAM_MAX_W = 2560  # 1x view is downscaled for the stream; zoomed views stay native
 PORT = config.PORT
 
@@ -148,12 +151,18 @@ class Service:
         self.mode = "river"
         # overlay toggles (dashboard checkboxes; the detector is unaffected either way)
         self.overlays = {"ais": True, "bearing": True, "trails": True, "water": True, "boxes": True}
-        self.save_crops = True  # dashboard toggle: sightings still logged when off, just no photo
+        # Off by default: sightings are logged, tracked and boxed either way; this only
+        # controls whether a photo of each one is written to disk.
+        self.save_crops = False
         self.lens = river_lens()
         self.image = river_image()
         self.calib_msg = ""
         self.vid = None  # latest 1080p frame, used by focus calibration
         self.view_rect = None  # what the dashboard shows (x, y, w, h as 0-1); crops follow it
+        self.enc_q = None      # on-camera H.264 bitstream (4K30)
+        self.hls = None        # ffmpeg process segmenting that bitstream for the browser
+        self.hls_last = 0.0    # last time a viewer asked for a segment
+        self.rec = None        # {"file": ..., "until": ..., "path": ...} while recording
         self.face_box = None
         self.stats = {"started": time.time(), "sightings": 0, "det_msgs": 0}
         os.makedirs(os.path.join(OUT, "sightings"), exist_ok=True)
@@ -203,6 +212,12 @@ class Service:
         lossy(sc.inputs["in"])
         src.link(sc.inputs["in"])
         self.still_q = sc.outputs["out"].createOutputQueue(maxSize=1, blocking=False)
+
+        enc = p.create(dai.node.VideoEncoder)
+        enc.setDefaultProfilePreset(FPS, dai.VideoEncoderProperties.Profile.H264_MAIN)
+        lossy(enc.input)
+        src.link(enc.input)
+        self.enc_q = enc.bitstream.createOutputQueue(maxSize=30, blocking=False)
 
         vid = cam.requestOutput((1920, 1080), dai.ImgFrame.Type.NV12, fps=FPS)
         self.vid_q = vid.createOutputQueue(maxSize=1, blocking=False)
@@ -309,6 +324,79 @@ class Service:
             ["osascript", "-e", f'display notification "{label} on the Hudson" with title "Ship spotter"'],
             capture_output=True,
         )
+
+    # ---------- HD video (4K H.264 straight off the camera) ----------
+    def start_hls(self):
+        if self.hls and self.hls.poll() is None:
+            return
+        os.makedirs(HLS_DIR, exist_ok=True)
+        for f in os.listdir(HLS_DIR):
+            os.remove(os.path.join(HLS_DIR, f))
+        self.hls = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-framerate", str(FPS), "-i", "pipe:0",
+             "-c", "copy", "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
+             "-hls_flags", "delete_segments+append_list+independent_segments",
+             "-hls_segment_type", "fmp4", os.path.join(HLS_DIR, "live.m3u8")],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0)
+        print("hd video: started")
+
+    def stop_hls(self):
+        if self.hls:
+            try:
+                self.hls.stdin.close()
+                self.hls.terminate()
+            except OSError:
+                pass
+            self.hls = None
+            print("hd video: stopped (idle)")
+
+    def start_recording(self, seconds):
+        os.makedirs(CLIPS_DIR, exist_ok=True)
+        ts = int(time.time())
+        raw = os.path.join(CLIPS_DIR, f"{ts}.h264")
+        self.rec = {"file": open(raw, "wb"), "until": time.time() + seconds, "raw": raw,
+                    "path": os.path.join(CLIPS_DIR, f"{ts}.mp4"), "started": time.time(), "frames": 0}
+        return self.rec["path"]
+
+    def _finish_recording(self):
+        rec, self.rec = self.rec, None
+        rec["file"].close()
+        # The camera delivers fewer than FPS frames while detection runs, so mux at the
+        # rate actually captured; muxing at 30 made a 5 s clip play as 1.2 s.
+        elapsed = max(0.1, time.time() - rec["started"])
+        fps = max(1.0, rec["frames"] / elapsed)
+        rate = f"{rec['frames']}/{elapsed:.3f}".replace(".", "")  # exact fraction, e.g. 101/8000
+        rate = f"{rec['frames'] * 1000}/{int(elapsed * 1000)}"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-r", rate,
+                        "-i", rec["raw"], "-c", "copy", "-movflags", "+faststart", "-y", rec["path"]],
+                       capture_output=True)
+        print(f"clip: {rec['frames']} frames over {elapsed:.1f}s -> {fps} fps")
+        os.remove(rec["raw"])
+        print("clip saved:", rec["path"])
+
+    def pump_video(self):
+        """Move encoded frames to whatever wants them (live HLS, recording)."""
+        if self.enc_q is None:
+            return
+        while True:
+            pkt = self.enc_q.tryGet()
+            if pkt is None:
+                break
+            if self.hls or self.rec:
+                data = pkt.getData().tobytes()
+                if self.hls and self.hls.poll() is None:
+                    try:
+                        self.hls.stdin.write(data)
+                        self.hls.stdin.flush()
+                    except (BrokenPipeError, ValueError):
+                        self.hls = None
+                if self.rec:
+                    self.rec["file"].write(data)
+                    self.rec["frames"] += 1
+        if self.rec and time.time() > self.rec["until"]:
+            self._finish_recording()
+        if self.hls and time.time() - self.hls_last > HLS_IDLE_S and not self.rec:
+            self.stop_hls()
 
     # ---------- calibration ----------
     def calibrate(self, bands=None):
@@ -566,6 +654,7 @@ class Service:
                     self.stats["still_decode_ms"] = round((time.perf_counter() - t0) * 1000, 1)
                     with self.lock:
                         self.still = (time.time(), frame)
+                self.pump_video()
                 v = self.vid_q.tryGet()
                 if v is not None:
                     self.vid = v.getCvFrame()
@@ -668,6 +757,35 @@ class Service:
                         self._json({"error": "no frame yet"}, 503)
                     else:
                         self._bytes(jpg, "image/jpeg")
+                elif path.startswith("/hls/"):
+                    name = os.path.basename(path[len("/hls/"):])
+                    svc.hls_last = time.time()
+                    if not svc.hls:
+                        svc.start_hls()
+                    fp = os.path.join(HLS_DIR, name)
+                    # ffmpeg writes the playlist only after the first full segment, which
+                    # takes a few seconds at the frame rate detection leaves us
+                    for _ in range(150 if name.endswith(".m3u8") else 60):
+                        if os.path.exists(fp):
+                            break
+                        time.sleep(0.1)
+                    if not os.path.exists(fp):
+                        return self._json({"error": "starting hd video"}, 503)
+                    ctype = ("application/vnd.apple.mpegurl" if name.endswith(".m3u8")
+                             else "video/iso.segment" if name.endswith(".m4s") else "video/mp4")
+                    with open(fp, "rb") as f:
+                        self._bytes(f.read(), ctype)
+                elif path.startswith("/clip/"):
+                    name = os.path.basename(path[len("/clip/"):])
+                    fp = os.path.join(CLIPS_DIR, name)
+                    if name.endswith(".mp4") and os.path.isfile(fp):
+                        with open(fp, "rb") as f:
+                            self._bytes(f.read(), "video/mp4")
+                    else:
+                        self._json({"error": "not found"}, 404)
+                elif path == "/clips":
+                    names = sorted((f for f in os.listdir(CLIPS_DIR) if f.endswith(".mp4")), reverse=True) if os.path.isdir(CLIPS_DIR) else []
+                    self._json([{"name": n, "url": f"/clip/{n}", "size": os.path.getsize(os.path.join(CLIPS_DIR, n))} for n in names[:20]])
                 elif path.startswith("/crop/"):
                     name = os.path.basename(path[len("/crop/"):])  # basename blocks path traversal
                     fp = os.path.join(OUT, "sightings", name)
@@ -695,6 +813,7 @@ class Service:
                     self._json({
                         **svc.stats, "mode": svc.mode, "calibrated": bool(svc.geo), "save_crops": svc.save_crops,
                         "lens": svc.lens, "calib_msg": svc.calib_msg, "bands": svc.bands, "image": svc.image, "overlays": svc.overlays,
+                        "hd_live": bool(svc.hls), "recording": bool(svc.rec),
                         "water_auto": svc.water is not None,
                         "heading": svc.geo["heading"] if svc.geo else None,
                         "geo": svc.geo,
@@ -712,6 +831,18 @@ class Service:
             def do_POST(self):
                 if self.path == "/scan":
                     self._json(svc.scan())
+                elif self.path == "/record":
+                    if svc.rec:
+                        return self._json({"error": "already recording"}, 409)
+                    n = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        secs = float(json.loads(self.rfile.read(n) or b"{}").get("seconds", 30))
+                    except ValueError:
+                        secs = 30
+                    secs = max(2.0, min(300.0, secs))
+                    path_out = svc.start_recording(secs)
+                    self._json({"recording": True, "seconds": secs, "path": path_out,
+                                "url": "/clip/" + os.path.basename(path_out)})
                 elif self.path == "/view":
                     n = int(self.headers.get("Content-Length") or 0)
                     try:

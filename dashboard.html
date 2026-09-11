@@ -47,6 +47,7 @@
   button.ghost { background:var(--bg); color:var(--text); border:1px solid var(--line); padding:4px 10px; font-weight:500; }
   button.ghost.paused { color:var(--warn); border-color:var(--warn); }
   #frame { cursor:crosshair; }
+  #hdvideo { width:100%; display:block; border-radius:6px; background:#000; aspect-ratio:16/9; }
   #stage { position:relative; }
   #draw-layer { position:absolute; inset:0; pointer-events:none; }
   #stage.drawing #draw-layer { pointer-events:auto; cursor:crosshair; background:rgba(79,179,255,.06); outline:2px dashed var(--accent); border-radius:6px; }
@@ -84,6 +85,8 @@
           <button class="z on" data-z="1">1x</button><button class="z" data-z="2">2x</button><button class="z" data-z="4">4x</button><button class="z" data-z="8">8x</button>
           <button id="crop" class="ghost" style="margin-left:8px">Crop view</button><button id="uncrop" class="ghost" hidden>Uncrop</button>
           <button id="layers" class="ghost" style="margin-left:8px">Overlays</button>
+          <button id="hd" class="ghost" style="margin-left:8px">HD video</button>
+          <button id="rec" class="ghost">Record 30s</button>
         </div>
       </div>
       <div id="layers-panel" class="row" hidden style="margin-bottom:8px">
@@ -95,8 +98,11 @@
       </div>
       <div id="stage">
         <img id="frame" alt="Latest camera frame with river bands and tracked boats">
+        <video id="hdvideo" hidden playsinline autoplay muted controls></video>
         <div id="draw-layer"></div>
       </div>
+      <div id="hd-note" class="meta" hidden>4K H.264 straight off the camera, about 17 fps while detection runs (30+ with it paused). No overlays on this view, and a few seconds behind live.</div>
+      <div id="clips" class="meta"></div>
       <div class="meta">Blue outline: water watched by the detector. Green: moving boats (sightings). Gray: detected but not moving yet. Green line: boat's path over the last 90 s. Orange labels: where AIS says each ship is (needs camera position; stopped ships in gray). Drag a rectangle to zoom to it, click to zoom to a point, double-click to reset. Native 4K pixels, no upscaling on the server. <span id="res"></span></div>
     </div>
     <div class="panel">
@@ -395,6 +401,58 @@ $("g-save").onclick = () => {
 document.querySelectorAll(".nudge").forEach((b) => (b.onclick = () => postGeo({ nudge: Number(b.dataset.d) })));
 $("g-clear").onclick = () => postGeo({ clear_refs: true });
 $("ais-all").onchange = () => refreshAIS();
+
+// ---- HD video (4K H.264 via HLS) and clip recording ----
+let hdOn = false, hls = null;
+
+async function startHd() {
+  const v = $("hdvideo"), url = "/hls/live.m3u8";
+  if (v.canPlayType("application/vnd.apple.mpegurl")) { v.src = url; v.play().catch(() => {}); return; }
+  if (!window.Hls) {   // Safari plays HLS natively; other browsers need hls.js
+    await new Promise((res, rej) => {
+      const sc = document.createElement("script");
+      sc.src = "https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.17/hls.min.js";
+      sc.onload = res; sc.onerror = rej; document.head.appendChild(sc);
+    }).catch(() => { $("hd-note").textContent = "HD view needs hls.js (no network for the CDN) or Safari."; });
+  }
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ lowLatencyMode: true, liveSyncDurationCount: 2 });
+    hls.loadSource(url); hls.attachMedia(v); v.play().catch(() => {});
+  }
+}
+
+$("hd").onclick = async () => {
+  hdOn = !hdOn;
+  $("hd").classList.toggle("on", hdOn);
+  $("frame").hidden = hdOn; $("hdvideo").hidden = !hdOn; $("hd-note").hidden = !hdOn;
+  if (hdOn) { clearTimeout(frameTimer); $("frame").src = ""; await startHd(); }
+  else {
+    if (hls) { hls.destroy(); hls = null; }
+    $("hdvideo").removeAttribute("src"); $("hdvideo").load();
+    refreshNow();
+  }
+};
+
+$("rec").onclick = async () => {
+  $("rec").disabled = true;
+  $("clips").textContent = "Recording 30 s of 4K...";
+  try {
+    const r = await (await fetch("/record", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ seconds: 30 }) })).json();
+    if (r.error) { $("clips").textContent = r.error; return; }
+    setTimeout(listClips, 34000);
+    $("clips").textContent = "Recording... the clip appears here when it finishes.";
+  } finally { setTimeout(() => ($("rec").disabled = false), 34000); }
+};
+
+async function listClips() {
+  try {
+    const cs = await getJSON("/clips");
+    $("clips").innerHTML = cs.length
+      ? "Clips: " + cs.slice(0, 5).map((c) => `<a href="${c.url}" target="_blank" style="color:var(--accent)">${c.name} (${(c.size / 1e6).toFixed(0)} MB)</a>`).join(" · ")
+      : "";
+  } catch (e) {}
+}
+listClips();
 
 // ---- overlay toggles ----
 $("layers").onclick = () => { $("layers-panel").hidden = !$("layers-panel").hidden; $("layers").classList.toggle("on", !$("layers-panel").hidden); };
