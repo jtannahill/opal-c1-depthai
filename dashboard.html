@@ -285,6 +285,17 @@ function refreshFrame() {
     $("res").textContent = `live ~6 fps, ${w}x${h} source px, ${view.zoom.toFixed(1)}x`;
   };
   f.src = `/stream.mjpg?${streamParams()}&t=${Date.now()}`;
+  sendView();
+}
+
+// tell the service what is on screen, so sighting photos and scans match the view
+let lastView = "";
+function sendView() {
+  const rect = (crop || view.zoom > 1) && !drawing ? effectiveRect() : null;
+  const key = JSON.stringify(rect);
+  if (key === lastView) return;
+  lastView = key;
+  fetch("/view", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ rect }) }).catch(() => {});
 }
 
 // ---- crop: a remembered free-aspect window; zoom and clicks work inside it ----

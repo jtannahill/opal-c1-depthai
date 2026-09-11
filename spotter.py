@@ -153,6 +153,7 @@ class Service:
         self.image = river_image()
         self.calib_msg = ""
         self.vid = None  # latest 1080p frame, used by focus calibration
+        self.view_rect = None  # what the dashboard shows (x, y, w, h as 0-1); crops follow it
         self.face_box = None
         self.stats = {"started": time.time(), "sightings": 0, "det_msgs": 0}
         os.makedirs(os.path.join(OUT, "sightings"), exist_ok=True)
@@ -255,6 +256,12 @@ class Service:
                 pass  # device list changes while apps open/close cameras
             time.sleep(2)
 
+    def name_for(self, t):
+        """Best AIS match for a tracked box right now, or None."""
+        cx = (t.box[0] + t.box[2]) / 2
+        hit = calib.match(self.geo, cx, [v for v in self.ais.recent(max_age=300) if in_view_region(v)])
+        return (hit.name or str(hit.mmsi)) if hit else None
+
     # ---------- sightings ----------
     def on_sighting(self, t):
         now = time.time()
@@ -276,6 +283,12 @@ class Service:
             pad = 120
             a = (max(0, int(x1) - pad), max(0, int(y1) - pad))
             b = (min(W, int(x2) + pad), min(H, int(y2) + pad))
+            if self.view_rect:  # keep the photo inside what the dashboard is showing
+                vx, vy, vw, vh = self.view_rect
+                vx1, vy1 = int(vx * W), int(vy * H)
+                vx2, vy2 = int((vx + vw) * W), int((vy + vh) * H)
+                a = (max(a[0], vx1), max(a[1], vy1))
+                b = (min(b[0], vx2), min(b[1], vy2))
             crop_path = os.path.join(OUT, "sightings", f"{int(now)}_{t.tid}.jpg")
             cv2.imwrite(crop_path, img[a[1]:b[1], a[0]:b[0]])
         self.db_lock.acquire()
@@ -476,11 +489,15 @@ class Service:
             x1, y1, x2, y2 = (int(v) for v in t.box)
             pad = 18  # small hulls are ~20 px; pad so the box reads at 1080p
             a, b = (x1 - pad, y1 - pad), (x2 + pad, y2 + pad)
+            name = self.name_for(t) if self.geo else None
             if t.moving:
                 cv2.rectangle(img, a, b, (80, 220, 120), 5)
-                cv2.putText(img, f"#{t.tid} {t.px_per_s:.0f}px/s", (a[0], a[1] - 12), 0, 1.5, (80, 220, 120), 4)
+                label = f"#{t.tid} {t.px_per_s:.0f}px/s" + (f"  {name}" if name else "")
+                cv2.putText(img, label, (a[0], a[1] - 12), 0, 1.5, (80, 220, 120), 4)
             else:  # seen but not yet moved far enough to count (or moored)
                 cv2.rectangle(img, a, b, (170, 170, 170), 2)
+                if name:
+                    cv2.putText(img, name, (a[0], a[1] - 10), 0, 1.1, (170, 170, 170), 3)
         if self.geo and self.overlays["bearing"]:
             self.draw_bearings(img)
         if rect:  # free-aspect crop (x0, y0, w, h as 0-1 fractions of the frame)
@@ -505,9 +522,15 @@ class Service:
         if not still:
             return {"error": "no still yet"}
         ts = int(time.time())
+        frame = still[1]
+        if self.view_rect:  # scan what the dashboard is showing, not the whole window
+            vx, vy, vw, vh = self.view_rect
+            frame = frame[int(vy * H):int((vy + vh) * H), int(vx * W):int((vx + vw) * W)]
+            if frame.size == 0:
+                frame = still[1]
         raw = os.path.join(OUT, "scans", f"{ts}_raw.jpg")
-        cv2.imwrite(raw, still[1])
-        flat, found = ocr.flatten(still[1])
+        cv2.imwrite(raw, frame)
+        flat, found = ocr.flatten(frame)
         flat_path = os.path.join(OUT, "scans", f"{ts}.jpg")
         cv2.imwrite(flat_path, flat)
         lines = ocr.ocr(flat_path)
@@ -689,6 +712,23 @@ class Service:
             def do_POST(self):
                 if self.path == "/scan":
                     self._json(svc.scan())
+                elif self.path == "/view":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                        if "rect" not in body:
+                            return self._json({"view_rect": svc.view_rect})   # query, not a change
+                        r = body["rect"]
+                        if r is None:
+                            svc.view_rect = None          # explicit clear: show the whole frame
+                        elif isinstance(r, (list, tuple)) and len(r) == 4:
+                            svc.view_rect = tuple(float(v) for v in r)
+                        else:
+                            # malformed: keep the current view rather than silently dropping it
+                            return self._json({"error": "rect must be [x, y, w, h] or null"}, 400)
+                    except (ValueError, TypeError):
+                        return self._json({"error": "bad rect"}, 400)
+                    self._json({"view_rect": svc.view_rect})
                 elif self.path == "/overlays":
                     n = int(self.headers.get("Content-Length") or 0)
                     try:
