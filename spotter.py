@@ -47,19 +47,48 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out")
 W, H = roi.FRAME_W, roi.FRAME_H
 FPS = 30
-RIVER_EXPOSURE_US, RIVER_ISO = 1000, 100
+# Picture profile for the window view, measured Sep 11 2026 (see docs/quality-sweep).
+# Contrast +4 and sharpness 1 roughly double measured detail and raise contrast from
+# 38 to 57 on the water, at 3.5% clipped highlights; auto-everything blows the window out.
+IMAGE_DEFAULTS = {"exp": 1500, "iso": 100, "contrast": 4, "sharpness": 1,
+                  "luma": 1, "chroma": 1, "saturation": 0, "brightness": 0}
 CAM_JSON = os.path.join(OUT, "cam.json")  # lens position found by the last focus calibration
 FIT_EVERY_S = 600
 VCAM_NAME = "OBS Virtual Camera"
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
 
-def river_lens():
+def cam_json():
     try:
         with open(CAM_JSON) as f:
-            return int(json.load(f)["lens"])
-    except (OSError, ValueError, KeyError):
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def river_lens():
+    try:
+        return int(cam_json()["lens"])
+    except (KeyError, TypeError, ValueError):
         return 120  # measured best for distance on this mount, Sep 11 2026
+
+
+def river_image():
+    saved = cam_json().get("image") or {}
+    return {**IMAGE_DEFAULTS, **{k: v for k, v in saved.items() if k in IMAGE_DEFAULTS}}
+
+
+def apply_image(c, img, lens):
+    """Put a whole picture profile on a CameraControl."""
+    c.setManualExposure(int(img["exp"]), int(img["iso"]))
+    c.setManualFocus(int(lens))
+    c.setContrast(int(img["contrast"]))
+    c.setSharpness(int(img["sharpness"]))
+    c.setLumaDenoise(int(img["luma"]))
+    c.setChromaDenoise(int(img["chroma"]))
+    c.setSaturation(int(img["saturation"]))
+    c.setBrightness(int(img["brightness"]))
+    return c
 
 
 def compass(deg):
@@ -119,6 +148,7 @@ class Service:
         self.mode = "river"
         self.save_crops = True  # dashboard toggle: sightings still logged when off, just no photo
         self.lens = river_lens()
+        self.image = river_image()
         self.calib_msg = ""
         self.vid = None  # latest 1080p frame, used by focus calibration
         self.face_box = None
@@ -144,8 +174,7 @@ class Service:
     def build(self, p):
         cam = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
         cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
-        cam.initialControl.setManualExposure(RIVER_EXPOSURE_US, RIVER_ISO)
-        cam.initialControl.setManualFocus(self.lens)
+        apply_image(cam.initialControl, self.image, self.lens)
         self.ctl = cam.inputControl.createInputQueue()
 
         src = cam.requestOutput((W, H), dai.ImgFrame.Type.NV12, fps=FPS)
@@ -202,8 +231,7 @@ class Service:
             return
         c = dai.CameraControl()
         if mode == "river":
-            c.setManualExposure(RIVER_EXPOSURE_US, RIVER_ISO)
-            c.setManualFocus(self.lens)
+            apply_image(c, self.image, self.lens)
         else:  # webcam in use: auto everything, metered on a face if we have one
             c.setAutoExposureEnable()
             c.setAutoFocusMode(dai.CameraControl.AutoFocusMode.CONTINUOUS_VIDEO)
@@ -277,10 +305,7 @@ class Service:
             scores = []
             for lp in range(100, 141, 4):
                 self.calib_msg = f"focus sweep: lens {lp}"
-                c = dai.CameraControl()
-                c.setManualExposure(RIVER_EXPOSURE_US, RIVER_ISO)
-                c.setManualFocus(lp)
-                self.ctl.send(c)
+                self.ctl.send(apply_image(dai.CameraControl(), self.image, lp))
                 time.sleep(1.0)  # lens moves + settings apply a few frames late
                 s = []
                 for _ in range(3):
@@ -642,7 +667,7 @@ class Service:
                 elif path == "/status":
                     self._json({
                         **svc.stats, "mode": svc.mode, "calibrated": bool(svc.geo), "save_crops": svc.save_crops,
-                        "lens": svc.lens, "calib_msg": svc.calib_msg, "bands": svc.bands,
+                        "lens": svc.lens, "calib_msg": svc.calib_msg, "bands": svc.bands, "image": svc.image,
                         "water_auto": svc.water is not None,
                         "heading": svc.geo["heading"] if svc.geo else None,
                         "geo": svc.geo,
@@ -660,6 +685,28 @@ class Service:
             def do_POST(self):
                 if self.path == "/scan":
                     self._json(svc.scan())
+                elif self.path == "/image":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                        if body.get("reset"):
+                            img = dict(IMAGE_DEFAULTS)
+                        else:
+                            img = {**svc.image, **{k: int(v) for k, v in body.items() if k in IMAGE_DEFAULTS}}
+                        # ranges the RVC2 ISP accepts
+                        for k, lo, hi in [("exp", 100, 33000), ("iso", 100, 1600), ("contrast", -10, 10),
+                                          ("sharpness", 0, 4), ("luma", 0, 4), ("chroma", 0, 4),
+                                          ("saturation", -10, 10), ("brightness", -10, 10)]:
+                            img[k] = max(lo, min(hi, img[k]))
+                    except (ValueError, TypeError) as e:
+                        return self._json({"error": f"bad input: {e}"}, 400)
+                    svc.image = img
+                    if svc.mode == "river":
+                        svc.ctl.send(apply_image(dai.CameraControl(), img, svc.lens))
+                    if body.get("save") or body.get("reset"):
+                        with open(CAM_JSON, "w") as f:
+                            json.dump({**cam_json(), "lens": svc.lens, "image": img}, f, indent=1)
+                    self._json({"image": img, "saved": bool(body.get("save") or body.get("reset"))})
                 elif self.path == "/water/auto":
                     if svc.mode == "calibrating":
                         return self._json({"error": "calibration running"}, 409)

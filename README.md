@@ -62,6 +62,29 @@ instead of the laptop, exposure fixed for a bright window from a dark room,
 focus locked at infinity, several crops of the river cut out at full resolution
 and fed to a network, all at the same time as a webcam feed.
 
+### Tuning the picture yourself
+
+The ISP knobs are all reachable at runtime: exposure time, ISO, contrast,
+sharpness, luma and chroma denoise, saturation, brightness, white balance mode,
+anti-banding, and a lens position for focus. Sweeping them against measurements
+on the water beat guessing; on this window view, per 4K frame:
+
+| Setting | Effect measured on the water |
+| --- | --- |
+| Exposure 1000 -> 1500 us | mean 42 -> 66, crushed shadows 9.4% -> 2.1%, no clipping |
+| Contrast 0 -> +4 | contrast 44 -> 57, detail 712 -> 1280, clipped highlights 3.5% |
+| Contrast +8 | contrast 61 but 8% clipped: the bright shore starts burning out |
+| Sharpness 0 -> 1 | detail 412 -> 1283; 3 and 4 mostly add noise |
+| Luma denoise 4 | detail collapses (3300 -> 566); keep it at 0-2 |
+| setHdr | no effect on this sensor, on or off |
+| White balance modes | negligible here; daylight matches auto |
+
+Shipped default (`IMAGE_DEFAULTS`, adjustable live from the dashboard and saved
+to `out/cam.json`): exposure 1500 us, ISO 100, contrast +4, sharpness 1, luma
+and chroma denoise 1. Against the camera's own auto settings, that is the
+difference between a white rectangle where the river should be and a picture
+with the shoreline, piers and wakes all readable.
+
 Two things the vendor app still does better: it ships a tuned image pipeline
 (nicer colour and noise handling for faces in a room), and it works out of the
 box. Taking the camera over means doing that tuning yourself.

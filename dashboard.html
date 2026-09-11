@@ -57,6 +57,10 @@
   .form label { display:grid; grid-template-columns:120px 1fr; align-items:center; gap:8px; color:var(--dim); font-size:12px; }
   .form input { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; min-width:0; }
   .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .sliders { display:grid; gap:6px; }
+  .sliders label { display:grid; grid-template-columns:82px 1fr 42px; align-items:center; gap:8px; color:var(--dim); font-size:12px; }
+  .sliders span { text-align:right; font-variant-numeric:tabular-nums; color:var(--text); }
+  .sliders input[type=range] { width:100%; accent-color:var(--accent); }
   button.ghost.on { color:var(--accent); border-color:var(--accent); }
 </style>
 </head>
@@ -118,6 +122,24 @@
       </div>
       <div id="calib-out" class="meta"></div>
       <div id="calib-info" class="meta"></div>
+    </div>
+    <div class="panel">
+      <h2>Picture</h2>
+      <div class="meta" style="margin:0 0 8px">Applies live to the river view. Auto exposure blows out a bright window seen from a dark room, so these are manual.</div>
+      <div class="sliders">
+        <label>Exposure <input type="range" id="i-exp" min="200" max="6000" step="100"><span id="v-exp"></span></label>
+        <label>ISO <input type="range" id="i-iso" min="100" max="800" step="50"><span id="v-iso"></span></label>
+        <label>Contrast <input type="range" id="i-contrast" min="-6" max="10" step="1"><span id="v-contrast"></span></label>
+        <label>Sharpness <input type="range" id="i-sharpness" min="0" max="4" step="1"><span id="v-sharpness"></span></label>
+        <label>Denoise <input type="range" id="i-luma" min="0" max="4" step="1"><span id="v-luma"></span></label>
+        <label>Saturation <input type="range" id="i-saturation" min="-6" max="10" step="1"><span id="v-saturation"></span></label>
+        <label>Brightness <input type="range" id="i-brightness" min="-6" max="6" step="1"><span id="v-brightness"></span></label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="i-save">Save as default</button>
+        <button id="i-reset" class="ghost">Reset</button>
+      </div>
+      <div id="i-out" class="meta"></div>
     </div>
     <div class="panel">
       <h2>Camera position</h2>
@@ -194,6 +216,7 @@ async function refreshStatus() {
     $("calib-info").textContent = `Lens ${s.lens}. Bearing fit uses ${s.calib_obs} sightings (needs 8+, refits every 10 min).`;
     if (s.mode === "calibrating") $("calib-out").textContent = s.calib_msg;
     showGeo(s);
+    showImage(s.image);
     $("s-sight").textContent = s.sightings;
     $("s-moving").textContent = s.tracks_moving;
     $("s-ais").textContent = s.ais_vessels;
@@ -350,6 +373,35 @@ $("g-save").onclick = () => {
 document.querySelectorAll(".nudge").forEach((b) => (b.onclick = () => postGeo({ nudge: Number(b.dataset.d) })));
 $("g-clear").onclick = () => postGeo({ clear_refs: true });
 $("ais-all").onchange = () => refreshAIS();
+
+// ---- picture settings: live on input, saved on demand ----
+const IMG_KEYS = ["exp", "iso", "contrast", "sharpness", "luma", "saturation", "brightness"];
+let imgFilled = false, imgTimer = null;
+
+function showImage(img) {
+  if (!img) return;
+  for (const k of IMG_KEYS) {
+    if (!imgFilled) $("i-" + k).value = img[k];
+    $("v-" + k).textContent = k === "exp" ? img[k] + "us" : img[k];
+  }
+  imgFilled = true;
+}
+
+async function sendImage(body) {
+  const r = await (await fetch("/image", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+  if (r.error) { $("i-out").textContent = r.error; return; }
+  if (body.reset) imgFilled = false;
+  showImage(r.image);
+  $("i-out").textContent = r.saved ? "Saved as the startup default." : "Applied (not saved).";
+}
+
+IMG_KEYS.forEach((k) => ($("i-" + k).oninput = () => {
+  $("v-" + k).textContent = k === "exp" ? $("i-" + k).value + "us" : $("i-" + k).value;
+  clearTimeout(imgTimer);
+  imgTimer = setTimeout(() => sendImage({ [k]: Number($("i-" + k).value) }), 150);  // debounce while dragging
+}));
+$("i-save").onclick = () => sendImage({ save: true, ...Object.fromEntries(IMG_KEYS.map((k) => [k, Number($("i-" + k).value)])) });
+$("i-reset").onclick = () => sendImage({ reset: true });
 
 $("autowater").onclick = async () => {
   $("autowater").disabled = true;
