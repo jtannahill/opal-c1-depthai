@@ -1,0 +1,21 @@
+# Copy to config.toml and edit for your window. Example: a flat looking west over
+# San Francisco Bay. Nothing here is secret, but it does say where you are.
+
+[ais]
+# Box the AIS feed subscribes to: [[lat, lon], [lat, lon]]. Keep it a little
+# larger than what you can see; ships enter view before you spot them.
+bbox = [[37.74, -122.45], [37.84, -122.32]]
+
+# The water actually visible from the window: [lat_min, lat_max, lon_min, lon_max].
+# Ships outside this never get matched to a sighting, which keeps the naming honest.
+view_region = [37.76, 37.83, -122.44, -122.35]
+
+[calibration]
+# Where the camera itself might be, searched when you have not entered GPS.
+lat_range = [37.770, 37.800]
+lon_range = [-122.430, -122.400]
+# Which way it might point, degrees true (west-ish here).
+heading_range = [220, 330]
+
+[service]
+port = 8810
