@@ -57,6 +57,8 @@
   .form label { display:grid; grid-template-columns:120px 1fr; align-items:center; gap:8px; color:var(--dim); font-size:12px; }
   .form input { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; min-width:0; }
   .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .chk { display:flex; align-items:center; gap:5px; color:var(--dim); font-size:12px; }
+  .chk input { accent-color:var(--accent); }
   .sliders { display:grid; gap:6px; }
   .sliders label { display:grid; grid-template-columns:82px 1fr 42px; align-items:center; gap:8px; color:var(--dim); font-size:12px; }
   .sliders span { text-align:right; font-variant-numeric:tabular-nums; color:var(--text); }
@@ -81,7 +83,15 @@
         <div class="zoom">
           <button class="z on" data-z="1">1x</button><button class="z" data-z="2">2x</button><button class="z" data-z="4">4x</button><button class="z" data-z="8">8x</button>
           <button id="crop" class="ghost" style="margin-left:8px">Crop view</button><button id="uncrop" class="ghost" hidden>Uncrop</button>
+          <button id="layers" class="ghost" style="margin-left:8px">Overlays</button>
         </div>
+      </div>
+      <div id="layers-panel" class="row" hidden style="margin-bottom:8px">
+        <label class="chk"><input type="checkbox" data-ov="ais" checked> AIS labels</label>
+        <label class="chk"><input type="checkbox" data-ov="bearing" checked> Bearing ticks</label>
+        <label class="chk"><input type="checkbox" data-ov="boxes" checked> Boat boxes</label>
+        <label class="chk"><input type="checkbox" data-ov="trails" checked> Trails</label>
+        <label class="chk"><input type="checkbox" data-ov="water" checked> Water outline</label>
       </div>
       <div id="stage">
         <img id="frame" alt="Latest camera frame with river bands and tracked boats">
@@ -217,6 +227,7 @@ async function refreshStatus() {
     if (s.mode === "calibrating") $("calib-out").textContent = s.calib_msg;
     showGeo(s);
     showImage(s.image);
+    showOverlays(s.overlays);
     $("s-sight").textContent = s.sightings;
     $("s-moving").textContent = s.tracks_moving;
     $("s-ais").textContent = s.ais_vessels;
@@ -373,6 +384,19 @@ $("g-save").onclick = () => {
 document.querySelectorAll(".nudge").forEach((b) => (b.onclick = () => postGeo({ nudge: Number(b.dataset.d) })));
 $("g-clear").onclick = () => postGeo({ clear_refs: true });
 $("ais-all").onchange = () => refreshAIS();
+
+// ---- overlay toggles ----
+$("layers").onclick = () => { $("layers-panel").hidden = !$("layers-panel").hidden; $("layers").classList.toggle("on", !$("layers-panel").hidden); };
+document.querySelectorAll("[data-ov]").forEach((cb) => (cb.onchange = async () => {
+  await fetch("/overlays", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [cb.dataset.ov]: cb.checked }) });
+  refreshNow();
+}));
+let ovFilled = false;
+function showOverlays(ov) {
+  if (!ov || ovFilled) return;
+  document.querySelectorAll("[data-ov]").forEach((cb) => (cb.checked = ov[cb.dataset.ov]));
+  ovFilled = true;
+}
 
 // ---- picture settings: live on input, saved on demand ----
 const IMG_KEYS = ["exp", "iso", "contrast", "sharpness", "luma", "saturation", "brightness"];

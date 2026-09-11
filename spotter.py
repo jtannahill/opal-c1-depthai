@@ -146,6 +146,8 @@ class Service:
         self.lock = threading.Lock()
         self.still = None  # (ts, BGR 4000x3000)
         self.mode = "river"
+        # overlay toggles (dashboard checkboxes; the detector is unaffected either way)
+        self.overlays = {"ais": True, "bearing": True, "trails": True, "water": True, "boxes": True}
         self.save_crops = True  # dashboard toggle: sightings still logged when off, just no photo
         self.lens = river_lens()
         self.image = river_image()
@@ -457,16 +459,18 @@ class Service:
         if not still:
             return None
         img = still[1].copy()
-        if self.water is not None:
-            water.outline(img, self.water)
-        else:
-            for x1, y1, x2, y2 in self.bands:
-                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 160, 60), 4)
+        if self.overlays["water"]:
+            if self.water is not None:
+                water.outline(img, self.water)
+            else:
+                for x1, y1, x2, y2 in self.bands:
+                    cv2.rectangle(img, (x1, y1), (x2, y2), (255, 160, 60), 4)
         now = time.time()
-        self.draw_trails(img, now)
-        if self.geo:
+        if self.overlays["trails"]:
+            self.draw_trails(img, now)
+        if self.geo and self.overlays["ais"]:
             self.draw_ais_labels(img)
-        for t in list(self.boats.tracks.values()):
+        for t in list(self.boats.tracks.values()) if self.overlays["boxes"] else []:
             if now - t.last > 3:  # only boxes the detector is still seeing
                 continue
             x1, y1, x2, y2 = (int(v) for v in t.box)
@@ -477,7 +481,7 @@ class Service:
                 cv2.putText(img, f"#{t.tid} {t.px_per_s:.0f}px/s", (a[0], a[1] - 12), 0, 1.5, (80, 220, 120), 4)
             else:  # seen but not yet moved far enough to count (or moored)
                 cv2.rectangle(img, a, b, (170, 170, 170), 2)
-        if self.geo:
+        if self.geo and self.overlays["bearing"]:
             self.draw_bearings(img)
         if rect:  # free-aspect crop (x0, y0, w, h as 0-1 fractions of the frame)
             rx, ry, rw, rh = (min(max(v, 0.0), 1.0) for v in rect)
@@ -667,7 +671,7 @@ class Service:
                 elif path == "/status":
                     self._json({
                         **svc.stats, "mode": svc.mode, "calibrated": bool(svc.geo), "save_crops": svc.save_crops,
-                        "lens": svc.lens, "calib_msg": svc.calib_msg, "bands": svc.bands, "image": svc.image,
+                        "lens": svc.lens, "calib_msg": svc.calib_msg, "bands": svc.bands, "image": svc.image, "overlays": svc.overlays,
                         "water_auto": svc.water is not None,
                         "heading": svc.geo["heading"] if svc.geo else None,
                         "geo": svc.geo,
@@ -685,6 +689,16 @@ class Service:
             def do_POST(self):
                 if self.path == "/scan":
                     self._json(svc.scan())
+                elif self.path == "/overlays":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                    except ValueError:
+                        return self._json({"error": "bad input"}, 400)
+                    for k, v in body.items():
+                        if k in svc.overlays:
+                            svc.overlays[k] = bool(v)
+                    self._json({"overlays": svc.overlays})
                 elif self.path == "/image":
                     n = int(self.headers.get("Content-Length") or 0)
                     try:
