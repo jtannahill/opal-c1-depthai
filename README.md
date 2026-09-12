@@ -23,19 +23,25 @@ What this repo runs on one camera pointed out a window at a river:
 Nothing is flashed to the camera. DepthAI loads firmware into RAM; unplug it,
 plug it back in, open the vendor app and the camera is stock again.
 
-## Why bother: the C1 is on its way off the shelf
+## Why bother: the C1 is end of life
 
-On 1 June 2026 the company (now Opal Electronics Inc.) wrote: "Our cameras are
-old and will soon leave the shelf. But they will not leave you, we will service
-and support them for many years." (<https://op.al>)
+The C1 has been retired. On 1 June 2026 its maker (now Opal Electronics Inc.)
+wrote: "Our cameras are old and will soon leave the shelf. But they will not
+leave you, we will service and support them for many years." The old storefront
+at opalcamera.com now redirects to that announcement, with no shop behind it.
+(<https://op.al>)
 
-So the C1 is being retired from sale rather than abandoned, and Opal is still
-trading. Still, a camera whose model is winding down is exactly the hardware
-worth owning outright. The Myriad X inside it is a general-purpose vision
-processor with an open SDK, so the camera stays programmable and useful for as
-long as the hardware lasts, whatever happens to the vendor app, the product
-line or the company behind it. Everything here runs locally: no cloud, no
-account, no dependency on anyone's servers.
+So the company is still trading and promises support, but the product is done:
+no new C1s, and no reason to expect Opal Composer to keep pace with future
+macOS releases. A discontinued camera whose vendor app is frozen in time is
+either e-waste in waiting or, if you own the hardware outright, a rather good
+Myriad X vision computer with a 48 MP sensor bolted to it.
+
+That is the argument for this repo. The chip inside is a general-purpose vision
+processor with an open SDK, so the camera stays programmable for as long as the
+hardware lasts, whatever happens to the app, the product line or the company.
+Everything here runs locally: no cloud, no account, no vendor servers, nothing
+that can be switched off from the other end.
 
 ## What the Opal C1 actually is
 
