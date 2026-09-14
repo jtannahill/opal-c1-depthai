@@ -269,6 +269,21 @@ class Service:
         self.mode = mode
         print("mode ->", mode)
 
+    def watch_composer(self):
+        """Opal Composer is relaunched by its login-item helper, and then claims the
+        camera: DepthAI loses every stream, the pipeline dies, we restart, and about
+        50 s later it happens again. Keep it closed for as long as we hold the camera.
+        """
+        while True:
+            try:
+                if composer.running():
+                    composer.quit_composer()
+                    self.stats["composer_quits"] = self.stats.get("composer_quits", 0) + 1
+                    print("composer: reappeared and was quit again")
+            except Exception as e:
+                print("composer watchdog:", str(e)[:80])
+            time.sleep(5)
+
     def watch_temp(self, dev):
         while True:
             try:
@@ -829,6 +844,7 @@ class Service:
     # ---------- main loop ----------
     def run(self):
         print("quit Composer:", composer.quit_composer())
+        threading.Thread(target=self.watch_composer, daemon=True).start()
         threading.Thread(target=lambda: asyncio.run(self.ais.run(ais.load_key())), daemon=True).start()
         threading.Thread(target=self.serve, daemon=True).start()
         self.vcam = None
