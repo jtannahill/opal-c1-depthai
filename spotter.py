@@ -42,6 +42,7 @@ import config
 import composer
 import ocr
 import roi
+import session as session_mod
 import tracker
 import water
 
@@ -110,6 +111,7 @@ HLS_DIR = os.path.join(OUT, "hls")       # live 4K H.264, segmented by ffmpeg
 CLIPS_DIR = os.path.join(OUT, "clips")
 HD_FLAG = os.path.join(OUT, "hd.on")     # presence = build the 4K encoder branch at startup
 HLS_IDLE_S = 25                          # stop encoding to disk once nobody is watching
+TILE_W, TILE_H = 768, 576   # larger tiles mean fewer networks reading every 4K frame
 STREAM_MAX_W = 2560  # 1x view is downscaled for the stream; zoomed views stay native
 PORT = config.PORT
 
@@ -132,7 +134,7 @@ def in_band(cx, cy, bands):
 
 
 class Service:
-    def __init__(self, face=False):
+    def __init__(self, face=False, session_secs=None):
         self.face = face
         # Water: the auto-detected mask when present, else the manually drawn boxes.
         # They never mix: drawing boxes deletes the mask, and auto-detect supersedes old
@@ -145,13 +147,15 @@ class Service:
         else:
             self.water = None
             self.bands = self.manual_bands
-        self.tiles = roi.tiles(self.bands, tw=512, th=384)
+        self.tiles = roi.tiles(self.bands, tw=TILE_W, th=TILE_H)
         self.boats = tracker.Tracker()
         self.ais = ais.Tracker()
         self.geo = calib.load()  # None until calib.py has a confident fit
         self.plane = groundplane.load()  # camera height + horizon row: turns pixels into positions
         self.plane_obs = 0               # unambiguous sightings the last fit had to work with
         self.marker = None               # (x, y, label, ts): last looked-up point, drawn on the view
+        self.stopping = False            # set the moment the link drops, so device polling stops
+        self.session = session_mod.Session(session_secs) if session_secs else None
         self.lock = threading.Lock()
         self.still = None  # (ts, BGR 4000x3000)
         self.mode = "river"
@@ -269,6 +273,35 @@ class Service:
         self.mode = mode
         print("mode ->", mode)
 
+    def run_session(self):
+        """Warm up, check the calibration against live AIS, watch, then write the report."""
+        warmup = min(120, max(30, self.session.seconds * 0.25))
+        time.sleep(8)
+        jpg = self.frame_jpeg(max_w=2560, quality=88)
+        self.session.save_frame("overview.jpg", jpg)
+        print(f"session: watching for {self.session.seconds / 60:.0f} min "
+              f"(calibration check after {warmup / 60:.0f} min)")
+        time.sleep(max(0, warmup - 8))
+        self.session.verdict = session_mod.verify(self.geo, self.session.checks)
+        v = self.session.verdict
+        print(f"session: calibration {v['status']} - {v.get('reason', '')}")
+        if v["status"] == "drifted":
+            self.session.notes.append(
+                f"Heading looks {abs(v['drift_deg']):.1f} deg out; {v['suggested_heading']} would fit better.")
+        while self.session.remaining > 0:
+            time.sleep(min(10, max(1, self.session.remaining)))
+        # one more check now that the whole session's sightings are in
+        final = session_mod.verify(self.geo, self.session.checks)
+        if final["status"] != "unknown":
+            self.session.verdict = final
+        self.session.save_frame("final.jpg", self.frame_jpeg(max_w=2560, quality=88))
+        path = self.session.write(geo=self.geo, plane=self.plane,
+                                  extra={"chip temperature": f"{self.stats.get('chip_c')} C",
+                                         "detections": self.stats.get("det_msgs"),
+                                         "frames": self.stats.get("stills")})
+        print("session: report written to", path)
+        os._exit(0)
+
     def watch_composer(self):
         """Opal Composer is relaunched by its login-item helper, and then claims the
         camera: DepthAI loses every stream, the pipeline dies, we restart, and about
@@ -285,12 +318,22 @@ class Service:
             time.sleep(5)
 
     def watch_temp(self, dev):
-        while True:
+        """Chip temperature, for diagnostics only: never worth crashing over.
+
+        Polling a device whose link has died takes a fatal signal inside
+        libdepthai-core, which killed the process before it could restart itself.
+        So this stops at the first error instead of probing a dead device.
+        """
+        while not self.stopping:
             try:
                 self.stats["chip_c"] = round(dev.getChipTemperature().average, 1)
             except Exception:
-                pass
-            time.sleep(20)
+                self.stats["chip_c"] = None
+                return
+            for _ in range(20):
+                if self.stopping:
+                    return
+                time.sleep(1)
 
     def watch_webcam(self):
         while True:
@@ -424,6 +467,22 @@ class Service:
         self.db.commit()
         self.db_lock.release()
         self.stats["sightings"] += 1
+        if self.session:
+            w = self.world_of(t)
+            if not crop_path and still:  # a report wants pictures even when the dashboard does not
+                pad = 120
+                a = (max(0, int(x1) - pad), max(0, int(y1) - pad))
+                b = (min(W, int(x2) + pad), min(H, int(y2) + pad))
+                crop_path = os.path.join(self.session.dir, f"{int(now)}_{t.tid}.jpg")
+                cv2.imwrite(crop_path, still[1][a[1]:b[1], a[0]:b[0]])
+            self.session.add({
+                "ts": now, "tid": t.tid, "name": name, "cx": cx,
+                "bearing": (self.geo["heading"] + math.degrees(math.atan((cx - W / 2) / self.geo["f"]))) % 360 if self.geo else None,
+                "range_km": round(w["range_m"] / 1000, 2) if w else None,
+                "knots": groundplane.speed_knots(self.geo, self.plane, t) if (self.geo and self.plane) else None,
+                "px_per_s": round(t.px_per_s, 1),
+                "crop": self.session.keep(crop_path),
+            }, cx=cx, cands=[[v.mmsi, v.name, v.lat, v.lon, v.sog, v.cog] for v in moving])
         label = name or "unidentified vessel"
         print(f"SIGHTING #{t.tid} {label} at x={cx:.0f} ({t.px_per_s:.1f}px/s)")
         subprocess.run(
@@ -868,6 +927,8 @@ class Service:
             p.start()
             threading.Thread(target=self.watch_webcam, daemon=True).start()
             threading.Thread(target=self.auto_fit, daemon=True).start()
+            if self.session:
+                threading.Thread(target=self.run_session, daemon=True).start()
             threading.Thread(target=lambda: self.watch_temp(dev), daemon=True).start()
             print(f"running: {len(self.tiles)} river tiles, webcam {VCAM_NAME if self.vcam else 'off'}, "
                   f"http://127.0.0.1:{PORT}")
@@ -917,10 +978,12 @@ class Service:
                     time.sleep(0.02)
                 except Exception as e:
                     # queues close when the device link drops; treat it as a device loss
+                    self.stopping = True
                     print("device error in main loop:", str(e)[:120])
                     break
         # The pipeline stopped: usually the USB link dropped. Restart the whole process,
         # which waits above for the camera to come back rather than dying silently.
+        self.stopping = True
         print("pipeline stopped (device link lost); restarting")
         if self.hls:
             self.stop_hls()
@@ -1296,6 +1359,10 @@ class Service:
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Hudson ship spotter on a repurposed Opal C1")
     ap.add_argument("--face", action="store_true", help="run YuNet to meter webcam exposure on a face")
-    Service(face=ap.parse_args().face).run()
+    ap.add_argument("--session", metavar="DURATION",
+                    help="watch for a fixed spell (20m, 45s, 1h), write a report, then exit")
+    args = ap.parse_args()
+    secs = session_mod.parse_duration(args.session) if args.session else None
+    Service(face=args.face, session_secs=secs).run()
