@@ -112,6 +112,7 @@ CLIPS_DIR = os.path.join(OUT, "clips")
 HD_FLAG = os.path.join(OUT, "hd.on")     # presence = build the 4K encoder branch at startup
 HLS_IDLE_S = 25                          # stop encoding to disk once nobody is watching
 TILE_W, TILE_H = 768, 576   # larger tiles mean fewer networks reading every 4K frame
+MAX_TILES = 6               # each tile is a network on the camera; more than this runs it out of memory
 STREAM_MAX_W = 2560  # 1x view is downscaled for the stream; zoomed views stay native
 PORT = config.PORT
 
@@ -148,6 +149,15 @@ class Service:
             self.water = None
             self.bands = self.manual_bands
         self.tiles = roi.tiles(self.bands, tw=TILE_W, th=TILE_H)
+        if len(self.tiles) > MAX_TILES:
+            # Each tile is a network plus its frame pool on the camera; too many exhausts
+            # device memory at pipeline start. A stale mask from a different lens once asked
+            # for 16. Grow the tiles until the count fits rather than failing to start.
+            tw, th = TILE_W, TILE_H
+            while len(self.tiles) > MAX_TILES and tw < 1920:
+                tw, th = int(tw * 1.5), int(th * 1.5)
+                self.tiles = roi.tiles(self.bands, tw=tw, th=th)
+            print(f"tiles: {tw}x{th} to stay within {MAX_TILES} ({len(self.tiles)} tiles)")
         self.boats = tracker.Tracker()
         self.ais = ais.Tracker()
         self.geo = calib.load()  # None until calib.py has a confident fit
@@ -1321,7 +1331,7 @@ class Service:
                         else:
                             lat, lon = float(body["lat"]), float(body["lon"])
                             hd, hfov = float(body["heading"]) % 360, float(body.get("hfov") or 72)
-                            if not (-90 <= lat <= 90 and -180 <= lon <= 180 and 20 <= hfov <= 150):
+                            if not (-90 <= lat <= 90 and -180 <= lon <= 180 and 0.5 <= hfov <= 150):
                                 raise ValueError("out of range")
                             geo = {"lat": lat, "lon": lon, "heading": hd, "f": round(calib.f_from_hfov(hfov), 1)}
                         geo["source"] = "gps"

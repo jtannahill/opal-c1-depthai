@@ -79,7 +79,10 @@ NULL_MARGIN = 4         # real fit must beat the best chance fit by this many si
 LATS = np.arange(config.CAL_LAT_RANGE[0], config.CAL_LAT_RANGE[1], 0.002)
 LONS = np.arange(config.CAL_LON_RANGE[0], config.CAL_LON_RANGE[1], 0.002)
 HEADINGS = np.arange(config.CAL_HEADING_RANGE[0], config.CAL_HEADING_RANGE[1], 2.0)
-FOCALS = np.arange(1600, 4001, 200.0)          # px at 4K; unknown lens, so search it too
+FOCALS = np.concatenate([                      # px at 4K; unknown optics, so search widely
+    np.arange(1600, 4001, 200.0),              # bare lens, roughly 50-100 deg of field
+    np.arange(5000, 60001, 2500.0),            # behind a telescope or binocular, down to ~4 deg
+])
 
 
 def _search(cxs, vlat, vlon, starts):
@@ -131,7 +134,7 @@ def solve_refs(lat, lon, refs, f_prior):
     if len(refs) == 1 or np.ptp(xs) < 600:  # refs too close together to pin the lens
         return heading_for(f_prior), f_prior, None
     best = None
-    for f in np.arange(1200, 5001, 10.0):
+    for f in np.arange(1200, 60001, 25.0):
         hd = heading_for(f)
         rel = (bears - hd + 540) % 360 - 180
         err = np.sqrt(np.mean((FRAME_CX + f * np.tan(np.radians(rel)) - xs) ** 2))
