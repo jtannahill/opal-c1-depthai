@@ -250,22 +250,44 @@ def probe_frames(path):
 
 
 
-def wait_for_device(timeout=25):
-    """Whatever held the camera leaves USB busy for a few seconds after it dies.
+def wait_for_device(timeout=40, settle=6.0):
+    """Whatever held the camera leaves USB busy for a while after it dies.
 
-    Starting a pipeline into that window crashes the device (it recovers on the
-    next run, which is how this got missed the first time).
+    Starting a pipeline into that window crashes the device, and it recovers on
+    the next run, which is how this hid twice. The device reports itself
+    available before it is actually ready, so appearing in the list is not
+    enough on its own: wait, then let callers confirm frames really flow.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if dai.Device.getAllAvailableDevices():
-            time.sleep(1.5)
+            time.sleep(settle)
             return True
         time.sleep(1.0)
     return False
 
 
-def calibrate(fps=24, use_face=True):
+def frames_flowing(q, timeout=6.0):
+    """A crashed device still hands back a queue; it just never fills it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if q.tryGet() is not None:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def calibrate(fps=24, use_face=True, attempts=3):
+    for attempt in range(1, attempts + 1):
+        if _calibrate_once(fps, use_face):
+            return
+        if attempt < attempts:
+            print(f"retrying ({attempt + 1} of {attempts}); letting the device settle")
+            time.sleep(8)
+    print("gave up: the camera would not come up cleanly")
+
+
+def _calibrate_once(fps=24, use_face=True):
     """Measure the look from the chair: expose for the face, focus on the face.
 
     Auto exposure is only used as an instrument. It is pointed at the face,
@@ -282,7 +304,7 @@ def calibrate(fps=24, use_face=True):
         print("closed Opal Composer to take the camera")
     if not wait_for_device():
         print("no camera showed up; is the spotter still holding it?")
-        return
+        return False
 
     with dai.Pipeline() as p:
         cam = p.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
@@ -293,6 +315,9 @@ def calibrate(fps=24, use_face=True):
         q = live.createOutputQueue(maxSize=3, blocking=False)
         ctl = cam.inputControl.createInputQueue()
         p.start()
+        if not frames_flowing(q):
+            print("camera came up but no frames arrived: it crashed on start")
+            return False
 
         def grab(n=12):
             for _ in range(n):
@@ -326,7 +351,7 @@ def calibrate(fps=24, use_face=True):
         if box is None:
             print("no face found in 30 s; nothing measured, config.toml untouched")
             print("if you are setting up with a stand-in or a chart, use --no-face")
-            return
+            return True
         if not use_face:
             print("using the centre of frame as the subject; put a stand-in in the chair")
         x1, y1, x2, y2 = box
@@ -421,6 +446,7 @@ def calibrate(fps=24, use_face=True):
                  "lens_position": lens, "white_balance_k": wb})
     save_look(look)
     print(f"\nwrote [interview] to config.toml: {look}")
+    return True
 
 
 def main():
