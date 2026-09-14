@@ -302,7 +302,8 @@ class Service:
             w = groundplane.pixel_to_world(self.geo, self.plane, x, y)
             if w:
                 out.update(lat=round(w["lat"], 6), lon=round(w["lon"], 6),
-                           range_m=round(w["range_m"]), range_km=round(w["range_m"] / 1000, 2))
+                           range_m=round(w["range_m"]), range_km=round(w["range_m"] / 1000, 2),
+                           estimated=bool(self.plane.get("estimated")))
             else:
                 out["note"] = "above the horizon: no position, bearing only"
         else:
@@ -345,11 +346,27 @@ class Service:
                 out["range_m"] = round(groundplane.range_m(self.geo["lat"], self.geo["lon"], lat, lon))
         return out
 
-    def name_for(self, t):
+    def ship_for(self, t):
         """Best AIS match for a tracked box right now, or None."""
+        if not self.geo:
+            return None
         cx = (t.box[0] + t.box[2]) / 2
-        hit = calib.match(self.geo, cx, [v for v in self.ais.recent(max_age=300) if in_view_region(v)])
+        return calib.match(self.geo, cx, [v for v in self.ais.recent(max_age=300) if in_view_region(v)])
+
+    def name_for(self, t):
+        hit = self.ship_for(t)
         return (hit.name or str(hit.mmsi)) if hit else None
+
+    def size_range_m(self, t):
+        """Stadiametric range from the matched ship's AIS length and the box width.
+
+        Only as good as the hull being broadside: bow-on it reads far too close,
+        so it is a fallback for when no ground plane has been fitted.
+        """
+        v = self.ship_for(t)
+        if not v or not v.length:
+            return None
+        return groundplane.range_from_size(self.geo["f"], t.box[2] - t.box[0], v.length)
 
     # ---------- sightings ----------
     def on_sighting(self, t):
@@ -661,7 +678,7 @@ class Service:
         info = self.at_pixel(cx, cy)
         label = f"{info['bearing']:.0f} {info['compass']}"
         if "range_km" in info:
-            label += f"   {info['range_km']} km"
+            label += f"   {'~' if info.get('estimated') else ''}{info['range_km']} km"
         (tw, th), _ = cv2.getTextSize(label, 0, 1.4, 3)
         cv2.rectangle(img, (cx - tw // 2 - 8, cy + 84), (cx + tw // 2 + 8, cy + 84 + th + 14), (0, 0, 0), -1)
         cv2.putText(img, label, (cx - tw // 2, cy + 84 + th + 4), 0, 1.4, col, 3)
@@ -682,7 +699,7 @@ class Service:
             if len(pts) < 2:
                 continue
             cv2.polylines(img, [np.array(pts, np.int32)], False, (120, 190, 255), 2)
-            label = f"{rng / 1000:g} km"
+            label = f"{'~' if self.plane.get('estimated') else ''}{rng / 1000:g} km"
             lx, ly = pts[0][0] + 10, pts[0][1] - 10
             (tw, th), _ = cv2.getTextSize(label, 0, 1.1, 2)
             cv2.rectangle(img, (lx - 5, ly - th - 8), (lx + tw + 5, ly + 5), (0, 0, 0), -1)
@@ -742,10 +759,15 @@ class Service:
             name = self.name_for(t) if self.geo else None
             w = self.world_of(t)
             kn = groundplane.speed_knots(self.geo, self.plane, t) if (self.geo and self.plane) else None
+            tilde = "~" if (self.plane or {}).get("estimated") else ""
             if t.moving:
                 cv2.rectangle(img, a, b, (80, 220, 120), 5)
-                speed = f"{kn:.1f}kn" if kn is not None else f"{t.px_per_s:.0f}px/s"
-                dist = f"  {w['range_m'] / 1000:.2f}km" if w else ""
+                speed = f"{tilde}{kn:.1f}kn" if kn is not None else f"{t.px_per_s:.0f}px/s"
+                if w:
+                    dist = f"  {tilde}{w['range_m'] / 1000:.2f}km"
+                else:
+                    sr = self.size_range_m(t)
+                    dist = f"  ~{sr / 1000:.2f}km" if sr else ""
                 label = f"#{t.tid} {speed}{dist}" + (f"  {name}" if name else "")
                 cv2.putText(img, label, (a[0], a[1] - 12), 0, 1.5, (80, 220, 120), 4)
             else:  # seen but not yet moved far enough to count (or moored)
@@ -1113,6 +1135,23 @@ class Service:
                     except (ValueError, TypeError):
                         return self._json({"error": "bad rect"}, 400)
                     self._json({"view_rect": svc.view_rect})
+                elif self.path == "/plane/estimate":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        height = float(json.loads(self.rfile.read(n) or b"{}")["height_m"])
+                    except (ValueError, KeyError, TypeError):
+                        return self._json({"error": "need height_m: the camera's height above the water"}, 400)
+                    if not 2 <= height <= 400:
+                        return self._json({"error": "height_m should be between 2 and 400"}, 400)
+                    y_h = groundplane.horizon_from_mask(svc.water, water.SCALE) if svc.water is not None else None
+                    if y_h is None:
+                        return self._json({"error": "no water mask: run Auto-detect water first"}, 400)
+                    plane = groundplane.estimate(y_h, height)
+                    groundplane.save(plane)
+                    svc.plane = plane
+                    self._json({"ok": True, "plane": plane,
+                                "msg": f"estimated from a {height:g} m camera height, horizon at row {y_h:.0f}. "
+                                       "Ranges are approximate until the plane is fitted from AIS."})
                 elif self.path == "/plane/fit":
                     plane = svc.fit_plane()
                     total = len(svc.q("SELECT 1 FROM calib_obs"))

@@ -122,6 +122,34 @@ def speed_knots(geo, plane, track):
     return d / (t1 - t0) * 1.94384
 
 
+def horizon_from_mask(mask, scale):
+    """Topmost water row in the mask, in frame pixels: a stand-in for the horizon.
+
+    The far shore sits slightly below the true horizon, so ranges estimated from
+    this run long at distance. Good enough to put reticles on the water.
+    """
+    import numpy as np
+
+    rows = np.flatnonzero(mask.any(axis=1))
+    return None if rows.size == 0 else float(rows[0] * scale)
+
+
+def estimate(y_horizon, height_m):
+    """A plane from an assumed camera height instead of fitted from AIS."""
+    return {"y_horizon": float(y_horizon), "height_m": float(height_m),
+            "rms_px": None, "n": 0, "estimated": True}
+
+
+def range_from_size(f, box_w_px, length_m):
+    """Stadiametric range: a vessel of known length subtending box_w_px pixels.
+
+    Assumes the hull is roughly broadside; bow-on it reads far too close.
+    """
+    if box_w_px <= 1 or length_m <= 0:
+        return None
+    return f * length_m / box_w_px
+
+
 if __name__ == "__main__":
     # Self-test: invent a camera, generate boats, check the fit recovers it.
     import random

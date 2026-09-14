@@ -157,9 +157,13 @@
     </div>
     <div class="panel">
       <h2>Map</h2>
-      <div class="meta" style="margin:0 0 8px">Top-down view from the camera. Needs the ground plane, which is fitted from sightings whose range AIS pins down.</div>
+      <div class="meta" style="margin:0 0 8px">Top-down view from the camera. Give your height above the water for an immediate estimate, or fit it properly from sightings whose range AIS pins down. Estimated distances are shown with a ~.</div>
       <canvas id="map" height="260"></canvas>
+      <div class="form" style="margin-top:8px">
+        <label>Camera height <input id="camheight" type="number" min="2" max="400" step="1" placeholder="metres above the water"></label>
+      </div>
       <div class="row" style="margin-top:8px">
+        <button id="estplane" class="ghost">Estimate from height</button>
         <button id="fitplane" class="ghost">Fit ground plane</button>
       </div>
       <div id="map-out" class="meta"></div>
@@ -582,6 +586,17 @@ async function refreshMap() {
       : "No ground plane yet: needs 8+ sightings with a single moving ship nearby.";
   } catch (e) {}
 }
+
+$("estplane").onclick = async () => {
+  const h = parseFloat($("camheight").value);
+  if (isNaN(h)) { $("map-out").textContent = "Enter roughly how far the camera sits above the water, in metres."; return; }
+  $("estplane").disabled = true;
+  try {
+    const r = await (await fetch("/plane/estimate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ height_m: h }) })).json();
+    $("map-out").textContent = r.error || r.msg;
+    refreshMap(); refreshNow();
+  } finally { $("estplane").disabled = false; }
+};
 
 $("fitplane").onclick = async () => {
   $("fitplane").disabled = true;
