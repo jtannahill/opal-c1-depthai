@@ -445,9 +445,16 @@ class Service:
                         if roi_img.size:
                             s.append(cv2.Laplacian(roi_img, cv2.CV_64F).var())
                 scores.append((sum(s) / len(s) if s else 0.0, lp))
-            best = max(scores)[1]
+            best_score, best = max(scores)
+            if best_score < 50:
+                # a night-time or blocked view scores single digits; 120 scored 1642 in daylight.
+                # Accepting that would overwrite a good focus with noise.
+                self.calib_msg = f"focus sweep inconclusive (best score {best_score:.1f}); keeping lens {self.lens}"
+                print("focus:", self.calib_msg)
+                best = self.lens
             with open(CAM_JSON, "w") as f:
-                json.dump({"lens": best, "sweep": [[lp, round(v, 1)] for v, lp in scores]}, f, indent=1)
+                json.dump({**cam_json(), "lens": best, "image": self.image,
+                           "sweep": [[lp, round(v, 1)] for v, lp in scores]}, f, indent=1)
             if bands:
                 roi.save(bands)
                 if os.path.exists(water.MASK_PATH):
