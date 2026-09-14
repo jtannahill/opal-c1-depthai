@@ -35,6 +35,7 @@ import depthai as dai
 
 import ais
 import calib
+import groundplane
 import cam_in_use
 import config
 import composer
@@ -106,6 +107,7 @@ while True:
 """
 HLS_DIR = os.path.join(OUT, "hls")       # live 4K H.264, segmented by ffmpeg
 CLIPS_DIR = os.path.join(OUT, "clips")
+HD_FLAG = os.path.join(OUT, "hd.on")     # presence = build the 4K encoder branch at startup
 HLS_IDLE_S = 25                          # stop encoding to disk once nobody is watching
 STREAM_MAX_W = 2560  # 1x view is downscaled for the stream; zoomed views stay native
 PORT = config.PORT
@@ -146,6 +148,8 @@ class Service:
         self.boats = tracker.Tracker()
         self.ais = ais.Tracker()
         self.geo = calib.load()  # None until calib.py has a confident fit
+        self.plane = groundplane.load()  # camera height + horizon row: turns pixels into positions
+        self.plane_obs = 0               # unambiguous sightings the last fit had to work with
         self.lock = threading.Lock()
         self.still = None  # (ts, BGR 4000x3000)
         self.mode = "river"
@@ -159,12 +163,13 @@ class Service:
         self.calib_msg = ""
         self.vid = None  # latest 1080p frame, used by focus calibration
         self.view_rect = None  # what the dashboard shows (x, y, w, h as 0-1); crops follow it
-        self.enc_q = None      # on-camera H.264 bitstream (4K30)
+        self.hd = os.path.exists(HD_FLAG)   # 4K encoder branch built only in HD mode
+        self.enc_q = None      # on-camera H.264 bitstream (4K30), HD mode only
         self.hls = None        # ffmpeg process segmenting that bitstream for the browser
         self.hls_last = 0.0    # last time a viewer asked for a segment
         self.rec = None        # {"file": ..., "until": ..., "path": ...} while recording
         self.face_box = None
-        self.stats = {"started": time.time(), "sightings": 0, "det_msgs": 0}
+        self.stats = {"started": time.time(), "sightings": 0, "det_msgs": 0, "chip_c": None}
         os.makedirs(os.path.join(OUT, "sightings"), exist_ok=True)
         os.makedirs(os.path.join(OUT, "scans"), exist_ok=True)
         self.db_path = os.path.join(OUT, "spotter.db")
@@ -213,11 +218,12 @@ class Service:
         src.link(sc.inputs["in"])
         self.still_q = sc.outputs["out"].createOutputQueue(maxSize=1, blocking=False)
 
-        enc = p.create(dai.node.VideoEncoder)
-        enc.setDefaultProfilePreset(FPS, dai.VideoEncoderProperties.Profile.H264_MAIN)
-        lossy(enc.input)
-        src.link(enc.input)
-        self.enc_q = enc.bitstream.createOutputQueue(maxSize=30, blocking=False)
+        if self.hd:
+            enc = p.create(dai.node.VideoEncoder)
+            enc.setDefaultProfilePreset(FPS, dai.VideoEncoderProperties.Profile.H264_MAIN)
+            lossy(enc.input)
+            src.link(enc.input)
+            self.enc_q = enc.bitstream.createOutputQueue(maxSize=30, blocking=False)
 
         vid = cam.requestOutput((1920, 1080), dai.ImgFrame.Type.NV12, fps=FPS)
         self.vid_q = vid.createOutputQueue(maxSize=1, blocking=False)
@@ -259,6 +265,14 @@ class Service:
         self.ctl.send(c)
         self.mode = mode
         print("mode ->", mode)
+
+    def watch_temp(self, dev):
+        while True:
+            try:
+                self.stats["chip_c"] = round(dev.getChipTemperature().average, 1)
+            except Exception:
+                pass
+            time.sleep(20)
 
     def watch_webcam(self):
         while True:
@@ -326,6 +340,15 @@ class Service:
         )
 
     # ---------- HD video (4K H.264 straight off the camera) ----------
+    def enable_hd(self):
+        """Turn on the encoder branch by restarting into HD mode (pipelines are static)."""
+        if self.hd:
+            return True
+        open(HD_FLAG, "w").close()
+        print("hd mode: restarting to add the encoder")
+        threading.Thread(target=lambda: (time.sleep(0.5), os.execv(sys.executable, [sys.executable, "-u", *sys.argv])), daemon=True).start()
+        return False
+
     def start_hls(self):
         if self.hls and self.hls.poll() is None:
             return
@@ -443,6 +466,33 @@ class Service:
         time.sleep(1.5)  # let the dashboard read the final message
         os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
 
+    def fit_plane(self):
+        """Fit camera height and horizon row from sightings with one unambiguous vessel."""
+        if not self.geo:
+            return None
+        obs = []
+        for cx, cy, aj in self.q("SELECT cx, cy, ais_json FROM calib_obs"):
+            try:
+                cands = [v for v in json.loads(aj) if v[4] >= 1.0]
+            except (ValueError, TypeError):
+                continue
+            if len(cands) == 1:  # only one moving ship nearby, so the match is not a guess
+                obs.append((cx, cy, cands[0][2], cands[0][3]))
+        self.plane_obs = len(obs)
+        plane = groundplane.fit(self.geo, obs)
+        if plane:
+            groundplane.save(plane)
+            self.plane = plane
+            print("ground plane:", plane)
+        return plane
+
+    def world_of(self, t):
+        """Where a tracked boat actually is, once the plane is known."""
+        if not (self.geo and self.plane):
+            return None
+        x1, y1, x2, y2 = t.box
+        return groundplane.pixel_to_world(self.geo, self.plane, (x1 + x2) / 2, y2)  # waterline, not centre
+
     def refit(self):
         """Known position (GPS): refine heading + lens only. Otherwise: full blind fit."""
         g = self.geo
@@ -455,6 +505,8 @@ class Service:
         if geo:
             self.geo = geo
             print("geo fit:", geo)
+        if self.geo:
+            self.fit_plane()
         return geo
 
     def auto_water(self, restart=True):
@@ -578,9 +630,13 @@ class Service:
             pad = 18  # small hulls are ~20 px; pad so the box reads at 1080p
             a, b = (x1 - pad, y1 - pad), (x2 + pad, y2 + pad)
             name = self.name_for(t) if self.geo else None
+            w = self.world_of(t)
+            kn = groundplane.speed_knots(self.geo, self.plane, t) if (self.geo and self.plane) else None
             if t.moving:
                 cv2.rectangle(img, a, b, (80, 220, 120), 5)
-                label = f"#{t.tid} {t.px_per_s:.0f}px/s" + (f"  {name}" if name else "")
+                speed = f"{kn:.1f}kn" if kn is not None else f"{t.px_per_s:.0f}px/s"
+                dist = f"  {w['range_m'] / 1000:.2f}km" if w else ""
+                label = f"#{t.tid} {speed}{dist}" + (f"  {name}" if name else "")
                 cv2.putText(img, label, (a[0], a[1] - 12), 0, 1.5, (80, 220, 120), 4)
             else:  # seen but not yet moved far enough to count (or moored)
                 cv2.rectangle(img, a, b, (170, 170, 170), 2)
@@ -638,56 +694,78 @@ class Service:
             self.vcam = pyvirtualcam.Camera(1920, 1080, FPS, fmt=pyvirtualcam.PixelFormat.BGR)
         except Exception as e:  # OBS Virtual Camera not installed: spotter + scanner still run
             print("webcam disabled:", e)
-        with dai.Pipeline() as p:
+        dev, attempt = None, 0
+        while dev is None:            # unplugged or USB reset: wait for it, however long it takes
+            try:
+                dev = dai.Device()
+            except Exception as e:
+                if attempt % 20 == 0:  # once a minute, not on every retry
+                    print("waiting for the camera:", str(e)[:80])
+                attempt += 1
+                time.sleep(3)
+        with dai.Pipeline(dev) as p:
             self.build(p)
             p.start()
             threading.Thread(target=self.watch_webcam, daemon=True).start()
             threading.Thread(target=self.auto_fit, daemon=True).start()
+            threading.Thread(target=lambda: self.watch_temp(dev), daemon=True).start()
             print(f"running: {len(self.tiles)} river tiles, webcam {VCAM_NAME if self.vcam else 'off'}, "
                   f"http://127.0.0.1:{PORT}")
-            while p.isRunning():
-                s = self.still_q.tryGet()
-                if s is not None:
-                    t0 = time.perf_counter()
-                    frame = s.getCvFrame()
-                    self.stats["stills"] = self.stats.get("stills", 0) + 1
-                    self.stats["still_decode_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-                    with self.lock:
-                        self.still = (time.time(), frame)
-                self.pump_video()
-                v = self.vid_q.tryGet()
-                if v is not None:
-                    self.vid = v.getCvFrame()
-                    self.vid_ts = time.time()
-                    self.stats["vid_frames"] = self.stats.get("vid_frames", 0) + 1
-                    if self.vcam:
-                        self.vcam.send(self.vid)
-                if self.face_q is not None:
-                    f = self.face_q.tryGet()
-                    dets = getattr(f, "detections", None) if f is not None else None
-                    if dets:
-                        b = max(dets, key=lambda d: d.confidence)
-                        r = b.rotated_rect.getOuterRect() if hasattr(b, "rotated_rect") else (b.xmin, b.ymin, b.xmax, b.ymax)
-                        self.face_box = tuple(r)
-                boxes = []
-                if self.mode == "river":  # auto-exposed frames make the river useless
-                    for tile, q in zip(self.tiles, self.det_q):
-                        d = q.tryGet()
-                        if d is None:
-                            continue
-                        self.stats["det_msgs"] += 1
-                        for det in d.detections:
-                            if self.labels[det.label] not in tracker.BOAT_LIKE:
+            while p.isRunning():   # falls out of this loop when the device link drops
+                try:
+                    s = self.still_q.tryGet()
+                    if s is not None:
+                        t0 = time.perf_counter()
+                        frame = s.getCvFrame()
+                        self.stats["stills"] = self.stats.get("stills", 0) + 1
+                        self.stats["still_decode_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                        with self.lock:
+                            self.still = (time.time(), frame)
+                    self.pump_video()
+                    v = self.vid_q.tryGet()
+                    if v is not None:
+                        self.vid = v.getCvFrame()
+                        self.vid_ts = time.time()
+                        self.stats["vid_frames"] = self.stats.get("vid_frames", 0) + 1
+                        if self.vcam:
+                            self.vcam.send(self.vid)
+                    if self.face_q is not None:
+                        f = self.face_q.tryGet()
+                        dets = getattr(f, "detections", None) if f is not None else None
+                        if dets:
+                            b = max(dets, key=lambda d: d.confidence)
+                            r = b.rotated_rect.getOuterRect() if hasattr(b, "rotated_rect") else (b.xmin, b.ymin, b.xmax, b.ymax)
+                            self.face_box = tuple(r)
+                    boxes = []
+                    if self.mode == "river":  # auto-exposed frames make the river useless
+                        for tile, q in zip(self.tiles, self.det_q):
+                            d = q.tryGet()
+                            if d is None:
                                 continue
-                            x1, y1, x2, y2 = self.tile_to_frame(tile, det)
-                            cx_, cy_ = (x1 + x2) / 2, (y1 + y2) / 2
-                            on_water = (water.contains(self.water, cx_, cy_) if self.water is not None
-                                        else in_band(cx_, cy_, self.bands))
-                            if on_water:
-                                boxes.append((x1, y1, x2, y2, det.confidence))
-                for t in self.boats.update(boxes):
-                    self.on_sighting(t)
-                time.sleep(0.02)
+                            self.stats["det_msgs"] += 1
+                            for det in d.detections:
+                                if self.labels[det.label] not in tracker.BOAT_LIKE:
+                                    continue
+                                x1, y1, x2, y2 = self.tile_to_frame(tile, det)
+                                cx_, cy_ = (x1 + x2) / 2, (y1 + y2) / 2
+                                on_water = (water.contains(self.water, cx_, cy_) if self.water is not None
+                                            else in_band(cx_, cy_, self.bands))
+                                if on_water:
+                                    boxes.append((x1, y1, x2, y2, det.confidence))
+                    for t in self.boats.update(boxes):
+                        self.on_sighting(t)
+                    time.sleep(0.02)
+                except Exception as e:
+                    # queues close when the device link drops; treat it as a device loss
+                    print("device error in main loop:", str(e)[:120])
+                    break
+        # The pipeline stopped: usually the USB link dropped. Restart the whole process,
+        # which waits above for the camera to come back rather than dying silently.
+        print("pipeline stopped (device link lost); restarting")
+        if self.hls:
+            self.stop_hls()
+        time.sleep(3)
+        os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
 
     # ---------- http ----------
     def serve(self):
@@ -760,6 +838,9 @@ class Service:
                 elif path.startswith("/hls/"):
                     name = os.path.basename(path[len("/hls/"):])
                     svc.hls_last = time.time()
+                    if not svc.hd:
+                        svc.enable_hd()
+                        return self._json({"error": "starting hd mode, retry in a few seconds"}, 503)
                     if not svc.hls:
                         svc.start_hls()
                     fp = os.path.join(HLS_DIR, name)
@@ -809,11 +890,30 @@ class Service:
                         out.append({"mmsi": v.mmsi, "name": v.name, "sog": v.sog, "cog": v.cog,
                                     "lat": v.lat, "lon": v.lon, "px": round(px) if px is not None else None})
                     self._json({"exact": bool(svc.geo), "vessels": out})
+                elif path == "/map":
+                    # top-down view: tracked boats placed on the water, plus AIS traffic
+                    boats = []
+                    for t in svc.boats.active_moving():
+                        w = svc.world_of(t)
+                        if w:
+                            boats.append({"tid": t.tid, "name": svc.name_for(t) if svc.geo else None,
+                                          "lat": w["lat"], "lon": w["lon"], "range_m": round(w["range_m"]),
+                                          "bearing": round(w["bearing"], 1),
+                                          "knots": groundplane.speed_knots(svc.geo, svc.plane, t)})
+                    ships = []
+                    if svc.geo:
+                        for v in svc.ais.recent(max_age=300):
+                            if in_view_region(v):
+                                ships.append({"mmsi": v.mmsi, "name": v.name, "lat": v.lat, "lon": v.lon,
+                                              "sog": v.sog, "cog": v.cog,
+                                              "range_m": round(groundplane.range_m(svc.geo["lat"], svc.geo["lon"], v.lat, v.lon)),
+                                              "bearing": round(calib.bearing(svc.geo["lat"], svc.geo["lon"], v.lat, v.lon), 1)})
+                    self._json({"camera": svc.geo, "plane": svc.plane, "boats": boats, "ships": ships})
                 elif path == "/status":
                     self._json({
                         **svc.stats, "mode": svc.mode, "calibrated": bool(svc.geo), "save_crops": svc.save_crops,
                         "lens": svc.lens, "calib_msg": svc.calib_msg, "bands": svc.bands, "image": svc.image, "overlays": svc.overlays,
-                        "hd_live": bool(svc.hls), "recording": bool(svc.rec),
+                        "hd_live": bool(svc.hls), "recording": bool(svc.rec), "plane": svc.plane,
                         "water_auto": svc.water is not None,
                         "heading": svc.geo["heading"] if svc.geo else None,
                         "geo": svc.geo,
@@ -834,6 +934,9 @@ class Service:
                 elif self.path == "/record":
                     if svc.rec:
                         return self._json({"error": "already recording"}, 409)
+                    if not svc.hd:
+                        svc.enable_hd()
+                        return self._json({"error": "starting hd mode, retry in a few seconds"}, 503)
                     n = int(self.headers.get("Content-Length") or 0)
                     try:
                         secs = float(json.loads(self.rfile.read(n) or b"{}").get("seconds", 30))
@@ -860,6 +963,20 @@ class Service:
                     except (ValueError, TypeError):
                         return self._json({"error": "bad rect"}, 400)
                     self._json({"view_rect": svc.view_rect})
+                elif self.path == "/plane/fit":
+                    plane = svc.fit_plane()
+                    total = len(svc.q("SELECT 1 FROM calib_obs"))
+                    usable = svc.plane_obs
+                    if plane:
+                        msg = f"ground plane fitted from {plane['n']} sightings"
+                    elif not svc.geo:
+                        msg = "set the camera position first"
+                    elif usable < 8:
+                        msg = f"only {usable} sightings have a single moving ship nearby (need 8; {total} logged in total)"
+                    else:
+                        msg = (f"{usable} usable sightings, but the fit was not trustworthy. "
+                               "Align the heading first: a wrong heading makes the ranges nonsense.")
+                    self._json({"ok": bool(plane), "plane": plane or svc.plane, "usable": usable, "logged": total, "msg": msg})
                 elif self.path == "/overlays":
                     n = int(self.headers.get("Content-Length") or 0)
                     try:

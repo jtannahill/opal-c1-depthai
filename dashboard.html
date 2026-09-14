@@ -60,6 +60,7 @@
   .row { display:flex; gap:8px; flex-wrap:wrap; }
   .chk { display:flex; align-items:center; gap:5px; color:var(--dim); font-size:12px; }
   .chk input { accent-color:var(--accent); }
+  #map { width:100%; display:block; background:var(--bg); border-radius:8px; }
   .sliders { display:grid; gap:6px; }
   .sliders label { display:grid; grid-template-columns:82px 1fr 42px; align-items:center; gap:8px; color:var(--dim); font-size:12px; }
   .sliders span { text-align:right; font-variant-numeric:tabular-nums; color:var(--text); }
@@ -138,6 +139,15 @@
       </div>
       <div id="calib-out" class="meta"></div>
       <div id="calib-info" class="meta"></div>
+    </div>
+    <div class="panel">
+      <h2>Map</h2>
+      <div class="meta" style="margin:0 0 8px">Top-down view from the camera. Needs the ground plane, which is fitted from sightings whose range AIS pins down.</div>
+      <canvas id="map" height="260"></canvas>
+      <div class="row" style="margin-top:8px">
+        <button id="fitplane" class="ghost">Fit ground plane</button>
+      </div>
+      <div id="map-out" class="meta"></div>
     </div>
     <div class="panel">
       <h2>Picture</h2>
@@ -453,6 +463,75 @@ async function listClips() {
   } catch (e) {}
 }
 listClips();
+
+// ---- top-down map ----
+const RINGS_M = [500, 1000, 2000, 4000];
+
+function drawMap(data) {
+  const c = $("map"), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = 260;
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const cam = { x: w / 2, y: h - 18 };
+  const maxM = RINGS_M[RINGS_M.length - 1];
+  const scale = (h - 34) / maxM;                       // metres -> px
+  const css = getComputedStyle(document.documentElement);
+  const dim = css.getPropertyValue("--dim").trim(), accent = css.getPropertyValue("--accent").trim();
+
+  g.strokeStyle = css.getPropertyValue("--line").trim();
+  g.fillStyle = dim; g.font = "10px -apple-system, sans-serif";
+  for (const m of RINGS_M) {                            // range rings
+    g.beginPath(); g.arc(cam.x, cam.y, m * scale, Math.PI, 2 * Math.PI); g.stroke();
+    g.fillText((m / 1000).toFixed(1) + " km", cam.x + 4, cam.y - m * scale + 11);
+  }
+  const hdg = data.camera ? data.camera.heading : 0;
+  const place = (brg, rng) => {                         // bearing relative to where the camera looks
+    const rel = ((brg - hdg + 540) % 360 - 180) * Math.PI / 180;
+    return [cam.x + Math.sin(rel) * rng * scale, cam.y - Math.cos(rel) * rng * scale];
+  };
+  g.strokeStyle = dim;                                  // field of view edges
+  for (const edge of [-40, 40]) {
+    const [x, y] = place(hdg + edge, maxM);
+    g.beginPath(); g.moveTo(cam.x, cam.y); g.lineTo(x, y); g.stroke();
+  }
+  g.fillStyle = accent; g.beginPath(); g.arc(cam.x, cam.y, 4, 0, 7); g.fill();
+
+  for (const s of data.ships || []) {                   // AIS traffic
+    const [x, y] = place(s.bearing, s.range_m);
+    g.fillStyle = "#e0a33a"; g.beginPath(); g.arc(x, y, 3, 0, 7); g.fill();
+    if (s.name) { g.fillStyle = dim; g.fillText(s.name.slice(0, 14), x + 6, y + 3); }
+  }
+  for (const b of data.boats || []) {                   // what the camera actually sees
+    const [x, y] = place(b.bearing, b.range_m);
+    g.fillStyle = "#46c28e"; g.beginPath(); g.arc(x, y, 5, 0, 7); g.fill();
+    g.fillStyle = "#e6e9ee";
+    g.fillText((b.name || "#" + b.tid) + (b.knots ? ` ${b.knots.toFixed(1)}kn` : ""), x + 7, y + 3);
+  }
+}
+
+async function refreshMap() {
+  try {
+    const d = await getJSON("/map");
+    drawMap(d);
+    $("map-out").textContent = d.plane
+      ? `Camera ${d.plane.height_m.toFixed(0)} m above the water, fit from ${d.plane.n} sightings (${d.plane.rms_px} px error).`
+      : "No ground plane yet: needs 8+ sightings with a single moving ship nearby.";
+  } catch (e) {}
+}
+
+$("fitplane").onclick = async () => {
+  $("fitplane").disabled = true;
+  try {
+    const r = await (await fetch("/plane/fit", { method: "POST" })).json();
+    $("map-out").textContent = r.msg;
+    refreshMap();
+  } finally { $("fitplane").disabled = false; }
+};
+
+refreshMap();
+setInterval(refreshMap, 4000);
 
 // ---- overlay toggles ----
 $("layers").onclick = () => { $("layers-panel").hidden = !$("layers-panel").hidden; $("layers").classList.toggle("on", !$("layers-panel").hidden); };
