@@ -136,6 +136,7 @@ def in_band(cx, cy, bands):
 
 class Service:
     def __init__(self, face=False, session_secs=None):
+        self.ctl = None                  # camera control queue; only exists once build() has run
         self.face = face
         # Water: the auto-detected mask when present, else the manually drawn boxes.
         # They never mix: drawing boxes deletes the mask, and auto-detect supersedes old
@@ -268,7 +269,7 @@ class Service:
 
     # ---------- exposure policy ----------
     def set_mode(self, mode):
-        if mode == self.mode:
+        if mode == self.mode or self.ctl is None:
             return
         c = dai.CameraControl()
         if mode == "river":
@@ -591,9 +592,14 @@ class Service:
     def calibrate(self, bands=None):
         """New location: re-sweep focus, optionally store new water bands, forget the
         old geometry, then restart the process so the tiles are rebuilt for the bands."""
+        if self.ctl is None:
+            self.calib_msg = "camera not ready yet"
+            return
         self.mode = "calibrating"
         try:
-            region = bands or self.bands
+            # with no water defined (cleared, or a fresh camera position) measure the
+            # whole frame: that is exactly when a focus sweep matters most
+            region = bands or self.bands or [(0, 0, W, H)]
             scores = []
             for lp in range(100, 141, 4):
                 self.calib_msg = f"focus sweep: lens {lp}"
@@ -684,15 +690,23 @@ class Service:
 
     def auto_water(self, restart=True):
         """Segment water in the current 4K still with SegFormer, save the mask, restart."""
-        with self.lock:
-            still = self.still
-        if not still:
+        for _ in range(40):            # a still arrives ~6 times a second once running
+            with self.lock:
+                still = self.still
+            if still and time.time() - still[0] < 5:
+                break
+            time.sleep(0.5)
+        else:
             self.calib_msg = "no frame yet"
             return False
         self.calib_msg = "detecting water (a few seconds)..."
         mask = water.segment(still[1])
-        if mask.mean() < 0.002:
-            self.calib_msg = "no water found; keeping the current water area"
+        if mask.mean() < 0.03:
+            # a window onto a river reads 30-40%; a few tenths of a percent is the model
+            # finding a puddle of reflection, not the Hudson
+            self.calib_msg = (f"only {mask.mean() * 100:.1f}% of the frame looked like water; "
+                              "keeping what was there. Try again in better light, or draw boxes.")
+            print("auto water:", self.calib_msg)
             return False
         water.save(mask)
         self.calib_msg = f"water found: {mask.mean() * 100:.1f}% of frame, {len(water.bands(mask))} area(s)"
@@ -734,7 +748,7 @@ class Service:
                 continue
             x = int(px)
             band = next((b for b in self.bands if b[0] <= x <= b[2]), None)
-            y_mark = band[1] if band else min(b[1] for b in self.bands)
+            y_mark = band[1] if band else (min((b[1] for b in self.bands), default=int(H * 0.6)))
             cog = "" if v.cog < 0 else f" {int(round(v.cog)):03d}T"
             label = f"{v.name or v.mmsi}  {v.sog:.1f}kn{cog}"
             (tw, th), _ = cv2.getTextSize(label, 0, 1.3, 3)
@@ -1292,6 +1306,34 @@ class Service:
                         with open(CAM_JSON, "w") as f:
                             json.dump({**cam_json(), "lens": svc.lens, "image": img}, f, indent=1)
                     self._json({"image": img, "saved": bool(body.get("save") or body.get("reset"))})
+                elif self.path == "/water/clear":
+                    # actually forget the water, so the outline goes at once
+                    if os.path.exists(water.MASK_PATH):
+                        os.remove(water.MASK_PATH)
+                    if os.path.exists(roi.PATH):
+                        os.remove(roi.PATH)
+                    svc.water, svc.bands, svc.manual_bands = None, [], []
+                    self._json({"cleared": True,
+                                "note": "detection is idle until you draw boxes or auto-detect water"})
+                elif self.path == "/water/boxes":
+                    # drawn boxes take effect immediately: outline and gating both follow
+                    n = int(self.headers.get("Content-Length") or 0)
+                    try:
+                        raw = json.loads(self.rfile.read(n) or b"{}").get("bands") or []
+                        bands = [tuple(int(v) for v in b) for b in raw]
+                        bands = [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)) for x1, y1, x2, y2 in bands]
+                        bands = [b for b in bands if b[2] - b[0] >= 64 and b[3] - b[1] >= 32
+                                 and 0 <= b[0] and b[2] <= W and 0 <= b[1] and b[3] <= H]
+                    except (ValueError, TypeError):
+                        return self._json({"error": "bands must be [[x1,y1,x2,y2], ...]"}, 400)
+                    if not bands:
+                        return self._json({"error": "no usable boxes"}, 400)
+                    roi.save(bands)
+                    if os.path.exists(water.MASK_PATH):
+                        os.remove(water.MASK_PATH)   # drawn boxes replace an auto-detected mask
+                    svc.water, svc.manual_bands, svc.bands = None, bands, bands
+                    self._json({"bands": bands,
+                                "note": "shown and gating now; the detector's crops follow on the next restart"})
                 elif self.path == "/water/auto":
                     if svc.mode == "calibrating":
                         return self._json({"error": "calibration running"}, 409)

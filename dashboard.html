@@ -134,7 +134,8 @@
       <div class="row">
         <button id="autowater">Auto-detect water</button>
         <button id="draw" class="ghost">Draw water boxes</button>
-        <button id="clear" class="ghost">Clear</button>
+        <button id="apply" class="ghost">Apply boxes</button>
+        <button id="clear" class="ghost">Clear water</button>
       </div>
       <div class="row" style="margin-top:8px">
         <button id="recal">Recalibrate</button>
@@ -385,7 +386,22 @@ $("draw").onclick = () => {
   $("draw").classList.toggle("on", drawing);
   $("draw").textContent = drawing ? "Done drawing" : "Draw water boxes";
 };
-$("clear").onclick = () => { boxes = []; renderBoxes(); };
+$("clear").onclick = async () => {
+  boxes = []; renderBoxes();
+  const r = await (await fetch("/water/clear", { method: "POST" })).json();
+  $("calib-out").textContent = r.note || "water cleared";
+  refreshStatus(); refreshNow();          // the outline goes from the next frame
+};
+
+$("apply").onclick = async () => {
+  if (!boxes.length) { $("calib-out").textContent = "Draw one or more boxes over the water first."; return; }
+  const r = await (await fetch("/water/boxes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bands: boxes }) })).json();
+  if (r.error) { $("calib-out").textContent = r.error; return; }
+  $("calib-out").textContent = `${r.bands.length} water box(es) applied. ${r.note}`;
+  boxes = []; renderBoxes();
+  if (drawing) $("draw").onclick();
+  refreshStatus(); refreshNow();          // the outline redraws as the new boxes
+};
 
 $("draw-layer").onmousedown = (e) => { drag = toFrame(e); e.preventDefault(); };
 $("draw-layer").onmousemove = (e) => {

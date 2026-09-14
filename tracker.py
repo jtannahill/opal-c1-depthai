@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 
 BOAT_LIKE = {"boat"}          # COCO classes treated as vessels
 MOVE_PX = 25                  # 4K pixels of center travel before a track is "moving"
-MAX_PX_S = 80                 # boats cross at <20 px/s; faster tracks are occluders or IoU jumps
+MAX_PX_S = 80                 # boats cross at <20 px/s on the bare lens; faster tracks are
+                              # occluders, IoU jumps, or shake (tighten this behind a telescope)
 MAX_BOX_W = 500               # 4K px; anything wider is a hand/person in front of the lens
 MAX_GAP_S = 8.0               # drop tracks unseen this long
 IOU_MATCH = 0.2

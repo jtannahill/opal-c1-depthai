@@ -36,17 +36,46 @@ def _load():
     return _model
 
 
-def segment(bgr):
-    """Boolean water mask at 1/SCALE resolution of the input frame."""
+def window_panes(bgr, min_frac=0.02):
+    """Bright regions of the frame: the view through the glass, pane by pane.
+
+    Shot from indoors, the frame is mostly dark mullion and reveal, and the scene
+    parser reads the whole image as a window: 43% wall, 42% windowpane, 0.4% water
+    on this view. Segmenting each lit pane instead removes that confusion entirely.
+    """
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    lit = (cv2.GaussianBlur(g, (21, 21), 0) > 70).astype(np.uint8)
+    lit = cv2.morphologyEx(lit, cv2.MORPH_CLOSE, np.ones((60, 60), np.uint8))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(lit)
+    panes = []
+    for i in range(1, n):
+        x, y, w, h = (int(v) for v in stats[i, :4])
+        if w * h >= min_frac * g.size and w > 200 and h > 200:
+            panes.append((x, y, w, h))
+    return panes or [(0, 0, bgr.shape[1], bgr.shape[0])]
+
+
+def _segment_region(bgr, ids, proc, model):
+    """Raw water mask for one region, at full region resolution."""
     import torch
 
-    proc, model, ids = _load()
-    rgb = np.ascontiguousarray(bgr[:, :, ::-1])
     with torch.no_grad():
-        logits = model(**proc(images=rgb, return_tensors="pt")).logits
-    h, w = bgr.shape[0] // SCALE, bgr.shape[1] // SCALE
+        logits = model(**proc(images=np.ascontiguousarray(bgr[:, :, ::-1]), return_tensors="pt")).logits
+    h, w = max(1, bgr.shape[0] // SCALE), max(1, bgr.shape[1] // SCALE)
     seg = torch.nn.functional.interpolate(logits, size=(h, w), mode="bilinear").argmax(1)[0].numpy()
-    mask = np.isin(seg, ids)
+    return np.isin(seg, ids)
+
+
+def segment(bgr):
+    """Boolean water mask at 1/SCALE resolution of the input frame."""
+    proc, model, ids = _load()
+    h, w = bgr.shape[0] // SCALE, bgr.shape[1] // SCALE
+    mask = np.zeros((h, w), bool)
+    for (x, y, pw, ph) in window_panes(bgr):
+        sub = _segment_region(bgr[y:y + ph, x:x + pw], ids, proc, model)
+        sy, sx = y // SCALE, x // SCALE
+        target = mask[sy:sy + sub.shape[0], sx:sx + sub.shape[1]]
+        target |= sub[:target.shape[0], :target.shape[1]]
 
     small = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
     # window mullions are near-black; shadowed water is dark but not that dark
