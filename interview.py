@@ -250,41 +250,64 @@ def probe_frames(path):
 
 
 
-def wait_for_device(timeout=40, settle=6.0):
-    """Whatever held the camera leaves USB busy for a while after it dies.
+class DeviceDead(Exception):
+    """The camera stopped delivering frames mid-pass."""
 
-    Starting a pipeline into that window crashes the device, and it recovers on
-    the next run, which is how this hid twice. The device reports itself
-    available before it is actually ready, so appearing in the list is not
-    enough on its own: wait, then let callers confirm frames really flow.
+
+def wait_for_device(timeout=60, settle=4.0):
+    """Take the camera only once the previous holder has really let go.
+
+    Presence in the device list is a bad signal on its own: the device is
+    listed while another process still owns it, and starting a pipeline into
+    that window crashes it. Worse, it can survive start and die a second later,
+    so no one-shot check at startup is enough either (see read_stream).
+
+    Waiting for the device to vanish and come back is the reliable signal. If
+    it never vanishes, nothing was holding it and we can go straight through.
     """
     deadline = time.time() + timeout
+    saw_gap = not dai.Device.getAllAvailableDevices()
     while time.time() < deadline:
-        if dai.Device.getAllAvailableDevices():
+        present = bool(dai.Device.getAllAvailableDevices())
+        if not present:
+            saw_gap = True
+        elif saw_gap:
             time.sleep(settle)
             return True
-        time.sleep(1.0)
-    return False
+        time.sleep(0.5)
+    return bool(dai.Device.getAllAvailableDevices())
 
 
-def frames_flowing(q, timeout=6.0):
-    """A crashed device still hands back a queue; it just never fills it."""
-    deadline = time.time() + timeout
+def read_stream(q, stall=6.0):
+    """Next genuinely new frame, or DeviceDead if the stream stops advancing.
+
+    A crashed device does not raise and does not close the queue. It just stops
+    filling it, and the last frame sits there being handed back forever. Two
+    separate false "no face found in 30 s" reports were really "no frames for
+    30 s", so freshness is tracked by sequence number rather than trusted.
+    """
+    last = getattr(read_stream, "_seq", None)
+    deadline = time.time() + stall
     while time.time() < deadline:
-        if q.tryGet() is not None:
-            return True
-        time.sleep(0.05)
-    return False
+        f = q.tryGet()
+        if f is not None and f.getSequenceNum() != last:
+            read_stream._seq = f.getSequenceNum()
+            return f
+        time.sleep(0.005)
+    raise DeviceDead(f"no new frame in {stall:.0f}s")
 
 
 def calibrate(fps=24, use_face=True, attempts=3):
     for attempt in range(1, attempts + 1):
-        if _calibrate_once(fps, use_face):
-            return
+        try:
+            if _calibrate_once(fps, use_face):
+                return
+        except DeviceDead as e:
+            print(f"camera stopped delivering frames ({e})")
         if attempt < attempts:
             print(f"retrying ({attempt + 1} of {attempts}); letting the device settle")
-            time.sleep(8)
-    print("gave up: the camera would not come up cleanly")
+            time.sleep(10)
+    print("gave up: the camera would not stay up")
 
 
 def _calibrate_once(fps=24, use_face=True):
@@ -315,13 +338,11 @@ def _calibrate_once(fps=24, use_face=True):
         q = live.createOutputQueue(maxSize=3, blocking=False)
         ctl = cam.inputControl.createInputQueue()
         p.start()
-        if not frames_flowing(q):
-            print("camera came up but no frames arrived: it crashed on start")
-            return False
+        read_stream._seq = None
 
         def grab(n=12):
             for _ in range(n):
-                f = q.get()
+                f = read_stream(q)
             return f
 
         def find_face(timeout=30):
@@ -401,14 +422,38 @@ def _calibrate_once(fps=24, use_face=True):
         ctl.send(c)
         time.sleep(1.5)
 
-        def sharpness_at(lp):
+        # The sweep takes about ten seconds and a person does not hold still for
+        # it, which broke the first version two ways: the face box measured up
+        # front went stale as the subject drifted out of it, and any single
+        # frame could be caught mid-motion. The result was noise with a fake
+        # peak, next to a textbook curve on a static subject.
+        #
+        # So re-find the face for every sample, and take the best of several
+        # frames rather than the mean. Motion blur only ever costs sharpness,
+        # so the sharpest frame at a given lens position is the one where the
+        # subject happened to be still, which is the number we actually want.
+        box_now = [x1, y1, x2, y2]
+
+        def score_once(frame):
+            fresh = faces.largest_box(frame) if use_face else None
+            if fresh is not None:
+                bx1, by1, bx2, by2 = fresh
+                # Ignore a wild jump; the detector occasionally finds a coat.
+                if abs((bx1 + bx2) / 2 - (box_now[0] + box_now[2]) / 2) < LIVE_W * 0.25:
+                    box_now[:] = [bx1, by1, bx2, by2]
+            bx1, by1, bx2, by2 = box_now
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            patch = g[int(by1):int(by2), int(bx1):int(bx2)]
+            return cv2.Laplacian(patch, cv2.CV_64F).var() if patch.size else 0.0
+
+        def sharpness_at(lp, samples=5):
             c = dai.CameraControl()
             c.setManualFocus(lp)
             ctl.send(c)
-            g = cv2.cvtColor(grab(14).getCvFrame(), cv2.COLOR_BGR2GRAY)
-            return cv2.Laplacian(g[int(y1):int(y2), int(x1):int(x2)], cv2.CV_64F).var()
+            grab(8)
+            return max(score_once(read_stream(q).getCvFrame()) for _ in range(samples))
 
-        print("sweeping focus, hold still...")
+        print("sweeping focus, hold as still as you can (about a minute)...")
         coarse = [(lp, sharpness_at(lp)) for lp in range(80, 211, 10)]
         for lp, sc in coarse:
             print(f"  lens {lp:3d}: {sc:8.1f}", flush=True)
@@ -417,7 +462,11 @@ def _calibrate_once(fps=24, use_face=True):
         for lp, sc in fine:
             print(f"  lens {lp:3d}: {sc:8.1f}", flush=True)
         lens, score = max(fine, key=lambda t: t[1])
+        spread = score / max(1e-6, min(v for _, v in fine))
         print(f"focus locked at lens {lens} (sharpness {score:.0f})")
+        if spread < 3:
+            print(f"  warning: the sweep is nearly flat (best is only {spread:.1f}x the worst),")
+            print("  so this peak may be noise. Hold still and run --calibrate again.")
 
         # --- framing check, so CROP_SPAN and FACE_Y get a sanity read ---
         c = dai.CameraControl()
