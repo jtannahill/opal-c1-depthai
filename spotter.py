@@ -322,14 +322,19 @@ class Service:
 
         Polling a device whose link has died takes a fatal signal inside
         libdepthai-core, which killed the process before it could restart itself.
-        So this stops at the first error instead of probing a dead device.
+        So it stops the moment the pipeline reports trouble, and gives up after a
+        run of failures, but rides out a single transient error.
         """
+        misses = 0
         while not self.stopping:
             try:
                 self.stats["chip_c"] = round(dev.getChipTemperature().average, 1)
+                misses = 0
             except Exception:
                 self.stats["chip_c"] = None
-                return
+                misses += 1
+                if misses >= 3:   # persistently unreachable: stop probing rather than risk the process
+                    return
             for _ in range(20):
                 if self.stopping:
                     return

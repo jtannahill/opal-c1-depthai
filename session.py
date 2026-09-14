@@ -102,11 +102,16 @@ class Session:
         return path
 
     def keep(self, src):
-        """Copy a sighting crop into the session folder so the report is self-contained."""
+        """Make sure a sighting crop sits in the session folder, and name it for the report.
+
+        The crop may already have been written here, in which case copying it would
+        be copying a file onto itself.
+        """
         if not src or not os.path.exists(src):
             return None
         dst = os.path.join(self.dir, os.path.basename(src))
-        shutil.copy2(src, dst)
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copy2(src, dst)
         return os.path.basename(dst)
 
     def write(self, geo=None, plane=None, extra=None):
