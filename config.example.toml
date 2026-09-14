@@ -19,3 +19,16 @@ heading_range = [220, 330]
 
 [service]
 port = 8810
+
+# Written by `interview.py --calibrate`, which measures these from the chair.
+# Delete the block to fall back to the defaults in interview.py, but do not
+# guess at them: a face at interview distance needs nothing like the exposure
+# a bright window view does.
+[interview]
+exposure_us = 8000
+iso = 200
+lens_position = 145
+white_balance_k = 5000
+contrast = 0
+sharpness = 1
+saturation = 0

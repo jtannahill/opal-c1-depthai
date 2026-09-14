@@ -196,6 +196,55 @@ just stay unnamed.
 | `roi.py` | Manual water boxes and tiling |
 | `cam_in_use.py` | CoreMediaIO check for whether an app is using a camera |
 | `composer.py` | Quits the vendor app so the camera is free |
+| `interview.py` | B-cam mode: locked 24p 4K recording, tracked live crop, reframe curve |
+
+## Interview B-cam
+
+`interview.py` uses the camera as the second angle in a two-camera interview,
+beside a proper A-cam, cut together in post.
+
+The webcam look comes from sitting two feet from the lens, not from the lens.
+So this mode assumes the subject sits back at a normal interview distance and
+takes the tighter framing out of the 48 MP sensor instead, which gives a close
+angle with flat, unexaggerated perspective.
+
+```
+uv run python interview.py --calibrate     # once per room, from the chair
+uv run python interview.py --seconds 1200  # a take
+```
+
+It records the full sensor frame at 3840x2160 and 60 Mbps, and does not bake
+the crop in: you reframe on the timeline with the whole image available. The
+damped face track drives only the live virtual-camera feed, and its path is
+written to the sidecar JSON as a reframe curve you can apply in post rather
+than hand-keying. Exposure, focus and white balance are fixed for the whole
+take, because anything that moves between the two cameras shows on the cut.
+
+There is no audio. Clap once on camera at the top for sync.
+
+### What the frame rate costs
+
+Measured on this hardware, 60 s sustained runs:
+
+| Pipeline | Delivered |
+| --- | --- |
+| 4K record + live tap, no NN | 99.6% of 24 fps |
+| 1440p record + live tap, no NN | 99.3% of 30 fps |
+| Same, plus YuNet on device | 85-90% at any resolution |
+| 4K + on-device ImageManip crop + YuNet | 5.9 fps |
+
+The on-device NN is the whole story: it costs about 30% of throughput and
+nothing beats 21.6 fps sustained while it is in the pipeline. Face detection
+belongs on the host, where macOS Vision does it in about 5 ms a frame. 30 fps
+is not reachable at 4K on this hardware; 24 is, and measures 24.006.
+
+Two measurement traps worth knowing if you benchmark this yourself. Short runs
+lie: 15 s reports 97-103% for configurations that sustain 85-90% over 60 s,
+because the warmup backlog sitting in the output queue gets counted, so drain
+every queue after starting before you time anything. And delivered rate must
+not come from the wall clock, because the encoder keeps running during the
+post-take drain and pushed one reading to 102% of nominal; use
+`getTimestampDevice()` on the encoded packets instead.
 
 ## Returning the camera to stock
 
