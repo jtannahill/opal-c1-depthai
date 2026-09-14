@@ -86,6 +86,7 @@
           <button class="z on" data-z="1">1x</button><button class="z" data-z="2">2x</button><button class="z" data-z="4">4x</button><button class="z" data-z="8">8x</button>
           <button id="crop" class="ghost" style="margin-left:8px">Crop view</button><button id="uncrop" class="ghost" hidden>Uncrop</button>
           <button id="layers" class="ghost" style="margin-left:8px">Overlays</button>
+          <button id="measure" class="ghost" style="margin-left:8px">Measure</button>
           <button id="hd" class="ghost" style="margin-left:8px">HD video</button>
           <button id="rec" class="ghost">Record 30s</button>
         </div>
@@ -96,6 +97,8 @@
         <label class="chk"><input type="checkbox" data-ov="boxes" checked> Boat boxes</label>
         <label class="chk"><input type="checkbox" data-ov="trails" checked> Trails</label>
         <label class="chk"><input type="checkbox" data-ov="water" checked> Water outline</label>
+        <label class="chk"><input type="checkbox" data-ov="reticle" checked> Centre reticle</label>
+        <label class="chk"><input type="checkbox" data-ov="ranges" checked> Range lines</label>
       </div>
       <div id="stage">
         <img id="frame" alt="Latest camera frame with river bands and tracked boats">
@@ -104,7 +107,7 @@
       </div>
       <div id="hd-note" class="meta" hidden>4K H.264 straight off the camera, about 17 fps while detection runs (30+ with it paused). No overlays on this view, and a few seconds behind live.</div>
       <div id="clips" class="meta"></div>
-      <div class="meta">Blue outline: water watched by the detector. Green: moving boats (sightings). Gray: detected but not moving yet. Green line: boat's path over the last 90 s. Orange labels: where AIS says each ship is (needs camera position; stopped ships in gray). Drag a rectangle to zoom to it, click to zoom to a point, double-click to reset. Native 4K pixels, no upscaling on the server. <span id="res"></span></div>
+      <div class="meta">Blue outline: water watched by the detector. Green: moving boats (sightings). Gray: detected but not moving yet. Green line: boat's path over the last 90 s. Orange labels: where AIS says each ship is (needs camera position; stopped ships in gray). Centre reticle shows where the camera points and how far that is; range lines mark 0.5, 1, 2 and 4 km on the water. Drag a rectangle to zoom to it, click to zoom to a point, double-click to reset. Native 4K pixels, no upscaling on the server. <span id="res"></span></div>
     </div>
     <div class="panel">
       <div class="bar">
@@ -139,6 +142,18 @@
       </div>
       <div id="calib-out" class="meta"></div>
       <div id="calib-info" class="meta"></div>
+    </div>
+    <div class="panel">
+      <h2>Lookup</h2>
+      <div class="meta" style="margin:0 0 8px">Click <b>Measure</b>, then click anywhere in the view for its compass bearing, and its coordinates once the ground plane is fitted. Or paste a position or bearing below to mark it in the view.</div>
+      <div id="at-out" class="meta">Nothing measured yet.</div>
+      <div class="form" style="margin-top:8px">
+        <label>Go to <input id="goto" placeholder="40.7612, -73.9965 or 287"></label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="goto-btn" class="ghost">Mark it</button>
+        <button id="copy-at" class="ghost">Copy coordinates</button>
+      </div>
     </div>
     <div class="panel">
       <h2>Map</h2>
@@ -464,6 +479,53 @@ async function listClips() {
 }
 listClips();
 
+// ---- lookup: pixel -> bearing/coordinates, and back ----
+let measuring = false, lastAt = null;
+
+$("measure").onclick = () => {
+  measuring = !measuring;
+  $("measure").classList.toggle("on", measuring);
+  $("measure").textContent = measuring ? "Click the view..." : "Measure";
+  if (measuring && aligning) { aligning = null; refreshAIS(); }
+};
+
+function renderAt(d) {
+  lastAt = d;
+  if (d.error) { $("at-out").textContent = d.error; return; }
+  const parts = [`<b>${d.bearing}&deg; ${d.compass}</b> true`];
+  if (d.lat !== undefined) parts.push(`${d.lat.toFixed(5)}, ${d.lon.toFixed(5)}`, `${d.range_km} km away`);
+  if (d.nearest_ship) parts.push(`nearest AIS: ${esc(d.nearest_ship.name)} (${d.nearest_ship.off_by_px} px off)`);
+  if (d.note) parts.push(`<span style="color:var(--dim)">${esc(d.note)}</span>`);
+  $("at-out").innerHTML = parts.join("<br>");
+}
+
+async function measureAt(e) {
+  const p = screenFrac(e), r = effectiveRect();
+  const x = Math.round((r[0] + p[0] * r[2]) * FW), y = Math.round((r[1] + p[1] * r[3]) * FH);
+  renderAt(await getJSON(`/at?x=${x}&y=${y}`));
+  measuring = false; $("measure").classList.remove("on"); $("measure").textContent = "Measure";
+  refreshNow();
+}
+
+$("goto-btn").onclick = async () => {
+  const v = $("goto").value.trim();
+  const ll = v.match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
+  const url = ll ? `/locate?lat=${ll[1]}&lon=${ll[2]}` : `/locate?bearing=${parseFloat(v)}`;
+  if (!ll && isNaN(parseFloat(v))) { $("at-out").textContent = "Enter coordinates or a bearing in degrees."; return; }
+  const d = await getJSON(url);
+  if (d.error) { $("at-out").textContent = d.error; return; }
+  $("at-out").innerHTML = d.in_frame
+    ? `Marked: <b>${d.bearing}&deg; ${d.compass}</b>` + (d.range_m ? `, ${(d.range_m / 1000).toFixed(2)} km away` : "")
+    : `${d.bearing}&deg; ${d.compass} is outside the camera's view.`;
+  refreshNow();
+};
+
+$("copy-at").onclick = () => {
+  if (!lastAt || lastAt.lat === undefined) { $("at-out").textContent = "Measure a point on the water first (needs the ground plane)."; return; }
+  navigator.clipboard.writeText(`${lastAt.lat}, ${lastAt.lon}`).then(() => ($("copy-at").textContent = "Copied"))
+    .finally(() => setTimeout(() => ($("copy-at").textContent = "Copy coordinates"), 1500));
+};
+
 // ---- top-down map ----
 const RINGS_M = [500, 1000, 2000, 4000];
 
@@ -649,6 +711,7 @@ function markZoomButtons() {
 let zdrag = null, aligning = null;
 window.addEventListener("keydown", (e) => { if (e.key === "Escape" && aligning) { aligning = null; $("g-out").textContent = "Align cancelled."; refreshAIS(); } });
 $("frame").onmousedown = (e) => {
+  if (measuring) { measureAt(e); e.preventDefault(); return; }
   if (aligning) {  // this click marks where the chosen ship really is
     // map the click through crop + zoom to a full-frame 4K column
     const p = screenFrac(e), r = effectiveRect(), target = aligning;

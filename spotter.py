@@ -31,6 +31,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
+import numpy as np
 import depthai as dai
 
 import ais
@@ -150,11 +151,13 @@ class Service:
         self.geo = calib.load()  # None until calib.py has a confident fit
         self.plane = groundplane.load()  # camera height + horizon row: turns pixels into positions
         self.plane_obs = 0               # unambiguous sightings the last fit had to work with
+        self.marker = None               # (x, y, label, ts): last looked-up point, drawn on the view
         self.lock = threading.Lock()
         self.still = None  # (ts, BGR 4000x3000)
         self.mode = "river"
         # overlay toggles (dashboard checkboxes; the detector is unaffected either way)
-        self.overlays = {"ais": True, "bearing": True, "trails": True, "water": True, "boxes": True}
+        self.overlays = {"ais": True, "bearing": True, "trails": True, "water": True, "boxes": True,
+                         "reticle": True, "ranges": True}
         # Off by default: sightings are logged, tracked and boxed either way; this only
         # controls whether a photo of each one is written to disk.
         self.save_crops = False
@@ -284,6 +287,63 @@ class Service:
             except OSError:
                 pass  # device list changes while apps open/close cameras
             time.sleep(2)
+
+    def at_pixel(self, x, y):
+        """What is at this pixel: bearing always, position once the plane is fitted."""
+        out = {"x": round(x), "y": round(y)}
+        if not self.geo:
+            out["error"] = "set the camera position first"
+            return out
+        rel = math.degrees(math.atan((x - W / 2) / self.geo["f"]))
+        out["rel_deg"] = round(rel, 2)
+        out["bearing"] = round((self.geo["heading"] + rel) % 360, 1)
+        out["compass"] = compass(out["bearing"])
+        if self.plane:
+            w = groundplane.pixel_to_world(self.geo, self.plane, x, y)
+            if w:
+                out.update(lat=round(w["lat"], 6), lon=round(w["lon"], 6),
+                           range_m=round(w["range_m"]), range_km=round(w["range_m"] / 1000, 2))
+            else:
+                out["note"] = "above the horizon: no position, bearing only"
+        else:
+            out["note"] = "no ground plane yet: bearing only"
+        # nearest AIS ship to that spot, by column and (when known) by range
+        best, best_d = None, 1e9
+        for v in self.ais.recent(max_age=300):
+            if not in_view_region(v):
+                continue
+            px = calib.project(self.geo, v.lat, v.lon)
+            if px is None:
+                continue
+            d = abs(px - x)
+            if d < best_d:
+                best, best_d = v, d
+        if best is not None and best_d < 200:
+            out["nearest_ship"] = {"name": best.name or str(best.mmsi), "mmsi": best.mmsi,
+                                   "sog": best.sog, "off_by_px": round(best_d)}
+        return out
+
+    def locate(self, lat=None, lon=None, bearing=None):
+        """Reverse lookup: where does a coordinate or bearing sit in the frame?"""
+        if not self.geo:
+            return {"error": "set the camera position first"}
+        if bearing is None:
+            bearing = calib.bearing(self.geo["lat"], self.geo["lon"], lat, lon)
+        rel = (bearing - self.geo["heading"] + 540) % 360 - 180
+        out = {"bearing": round(bearing % 360, 1), "compass": compass(bearing), "rel_deg": round(rel, 2)}
+        if abs(rel) > 80:
+            out["in_frame"] = False
+            out["note"] = "outside the camera's view"
+            return out
+        x = W / 2 + self.geo["f"] * math.tan(math.radians(rel))
+        out["x"] = round(x)
+        out["in_frame"] = 0 <= x < W
+        if lat is not None and self.plane:
+            xy = groundplane.world_to_pixel(self.geo, self.plane, lat, lon)
+            if xy:
+                out["x"], out["y"] = round(xy[0]), round(xy[1])
+                out["range_m"] = round(groundplane.range_m(self.geo["lat"], self.geo["lon"], lat, lon))
+        return out
 
     def name_for(self, t):
         """Best AIS match for a tracked box right now, or None."""
@@ -585,6 +645,49 @@ class Service:
             cv2.rectangle(img, (x - 6, y_text - th - 10), (x + tw + 6, y_text + 8), (0, 0, 0), -1)
             cv2.putText(img, label, (x, y_text), 0, 1.3, color, 3)
 
+    RANGE_RETICLES_M = (500, 1000, 2000, 4000)
+
+    def draw_reticle(self, img):
+        """Crosshair at the centre of frame, labelled with where it points and how far."""
+        cx, cy = W // 2, H // 2
+        col = (200, 200, 200)
+        cv2.line(img, (cx - 70, cy), (cx - 20, cy), col, 3)
+        cv2.line(img, (cx + 20, cy), (cx + 70, cy), col, 3)
+        cv2.line(img, (cx, cy - 70), (cx, cy - 20), col, 3)
+        cv2.line(img, (cx, cy + 20), (cx, cy + 70), col, 3)
+        cv2.circle(img, (cx, cy), 6, col, -1)
+        if not self.geo:
+            return
+        info = self.at_pixel(cx, cy)
+        label = f"{info['bearing']:.0f} {info['compass']}"
+        if "range_km" in info:
+            label += f"   {info['range_km']} km"
+        (tw, th), _ = cv2.getTextSize(label, 0, 1.4, 3)
+        cv2.rectangle(img, (cx - tw // 2 - 8, cy + 84), (cx + tw // 2 + 8, cy + 84 + th + 14), (0, 0, 0), -1)
+        cv2.putText(img, label, (cx - tw // 2, cy + 84 + th + 4), 0, 1.4, col, 3)
+
+    def draw_range_reticles(self, img):
+        """Lines across the water at fixed ranges: for a range R, each column's row
+        follows from the ground plane, so the line curves with sec(rel)."""
+        if not (self.geo and self.plane):
+            return
+        f, h, y0 = self.geo["f"], self.plane["height_m"], self.plane["y_horizon"]
+        for rng in self.RANGE_RETICLES_M:
+            pts = []
+            for x in range(0, W, 40):
+                rel = math.atan((x - W / 2) / f)
+                y = y0 + f * h / math.cos(rel) / rng
+                if 0 <= y < H:
+                    pts.append((x, int(y)))
+            if len(pts) < 2:
+                continue
+            cv2.polylines(img, [np.array(pts, np.int32)], False, (120, 190, 255), 2)
+            label = f"{rng / 1000:g} km"
+            lx, ly = pts[0][0] + 10, pts[0][1] - 10
+            (tw, th), _ = cv2.getTextSize(label, 0, 1.1, 2)
+            cv2.rectangle(img, (lx - 5, ly - th - 8), (lx + tw + 5, ly + 5), (0, 0, 0), -1)
+            cv2.putText(img, label, (lx, ly), 0, 1.1, (120, 190, 255), 2)
+
     def draw_bearings(self, img):
         """Compass ticks along the top edge from the fitted camera geometry."""
         g = self.geo
@@ -649,6 +752,18 @@ class Service:
                 cv2.rectangle(img, a, b, (170, 170, 170), 2)
                 if name:
                     cv2.putText(img, name, (a[0], a[1] - 10), 0, 1.1, (170, 170, 170), 3)
+        if self.marker and time.time() - self.marker[3] < 120:
+            mx, my, label, _ = self.marker
+            mx, my = int(mx), int(my)
+            cv2.drawMarker(img, (mx, my), (80, 200, 255), cv2.MARKER_CROSS, 60, 4)
+            cv2.circle(img, (mx, my), 26, (80, 200, 255), 3)
+            (tw, th), _ = cv2.getTextSize(label, 0, 1.3, 3)
+            cv2.rectangle(img, (mx + 30, my - th - 16), (mx + 40 + tw, my + 6), (0, 0, 0), -1)
+            cv2.putText(img, label, (mx + 35, my - 8), 0, 1.3, (80, 200, 255), 3)
+        if self.overlays.get("ranges", True):
+            self.draw_range_reticles(img)
+        if self.overlays.get("reticle", True):
+            self.draw_reticle(img)
         if self.geo and self.overlays["bearing"]:
             self.draw_bearings(img)
         if rect:  # free-aspect crop (x0, y0, w, h as 0-1 fractions of the frame)
@@ -778,7 +893,7 @@ class Service:
     def serve(self):
         svc = self
 
-        class H(BaseHTTPRequestHandler):
+        class Handler(BaseHTTPRequestHandler):
             def _json(self, obj, code=200):
                 body = json.dumps(obj, default=str, indent=1).encode()
                 self.send_response(code)
@@ -897,6 +1012,34 @@ class Service:
                         out.append({"mmsi": v.mmsi, "name": v.name, "sog": v.sog, "cog": v.cog,
                                     "lat": v.lat, "lon": v.lon, "px": round(px) if px is not None else None})
                     self._json({"exact": bool(svc.geo), "vessels": out})
+                elif path == "/at":
+                    from urllib.parse import parse_qs
+
+                    q = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                    try:
+                        x, y = float(q["x"]), float(q["y"])
+                    except (KeyError, ValueError):
+                        return self._json({"error": "need x and y in frame pixels"}, 400)
+                    info = svc.at_pixel(x, y)
+                    label = info.get("compass", "") and f"{info['bearing']:.0f} {info['compass']}"
+                    if "range_km" in info:
+                        label += f"  {info['range_km']}km"
+                    svc.marker = (x, y, label or "?", time.time())
+                    self._json(info)
+                elif path == "/locate":
+                    from urllib.parse import parse_qs
+
+                    q = {k: v[0] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                    try:
+                        if "bearing" in q:
+                            info = svc.locate(bearing=float(q["bearing"]))
+                        else:
+                            info = svc.locate(lat=float(q["lat"]), lon=float(q["lon"]))
+                    except (KeyError, ValueError):
+                        return self._json({"error": "need lat and lon, or bearing"}, 400)
+                    if info.get("x") is not None:
+                        svc.marker = (info["x"], info.get("y", H * 0.62), f"{info['bearing']:.0f} {info['compass']}", time.time())
+                    self._json(info)
                 elif path == "/map":
                     # top-down view: tracked boats placed on the water, plus AIS traffic
                     boats = []
@@ -1094,7 +1237,7 @@ class Service:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+        ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
