@@ -250,3 +250,7 @@ post-take drain and pushed one reading to 102% of nominal; use
 
 Stop the service, unplug the camera, plug it back in, open Opal Composer. The
 DepthAI firmware only ever lives in RAM; flash memory is never written.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
